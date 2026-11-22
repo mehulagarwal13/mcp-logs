@@ -18,10 +18,10 @@ impossible, since no `ConnectorSource` value existed to route through at
 all. `fetch_live_evidence` still always returns `[]`: no real monitoring/
 alerting API integration exists yet (that remains its own, separate,
 larger piece of work -- this change closes the "unreachable" gap, not the
-"no real backend" one). `connector_config.config` (the same free-form JSONB
+"no real backend" one). `connector.config` (the same free-form JSONB
 dict every other connector's registration already carries) is where a real
 future implementation would read e.g. an API base URL/query template from --
-already plumbed through via this method's `connector_config` parameter, so
+already plumbed through via this method's `connector` parameter, so
 no interface change is needed when that real backend is built.
 """
 
@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from app.core.tenancy.schemas import ConnectorConfig
+from app.core.tenancy.live_credentials import LiveConnectorCredential
 from app.shared.schemas import EvidenceItem
 
 
@@ -37,12 +37,17 @@ class MonitoringLiveSource:
     """Always returns no evidence -- see module docstring."""
 
     source_name = "monitoring"
+    # No real monitoring/alerting backend exists, so this must never be
+    # reported as a successful live lookup -- the investigation lists it as
+    # `not_implemented` and does not decrypt its connector's credential.
+    # Flip to True only together with a real `fetch_live_evidence`.
+    implemented = False
     requests_per_second = 1.0
 
     async def fetch_live_evidence(
         self,
         *,
-        connector_config: ConnectorConfig,
+        connector: LiveConnectorCredential,
         query: str,
         since: datetime,
         limit: int,

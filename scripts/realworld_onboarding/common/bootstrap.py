@@ -157,7 +157,10 @@ async def ensure_user_with_role(
     (it's bootstrapping one), so it sets the GUC directly using the already-
     known `organization_id`, exactly like `seed_test_organization.py` does.
     """
-    user_id = await users_service.get_or_create_user(session, email=email, display_name=display_name)
+    user_id = await users_service.get_or_create_user(
+        session, email=email, display_name=display_name,
+        email_verified_via="operator_attestation",  # onboarding harness bootstrap: trusted, explicit
+    )
     await set_tenant_context(session, organization_id)
     await users_service.assign_role(session, user_id=user_id, organization_id=organization_id, role_id=role_id)
     return user_id

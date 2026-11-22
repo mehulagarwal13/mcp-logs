@@ -20,6 +20,7 @@ would have been extremely difficult to notice or debug after the fact.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 
@@ -29,10 +30,15 @@ from app.shared.schemas import ActorKind, Identity
 
 
 class _FakeUserRow:
-    def __init__(self, *, user_id: uuid.UUID, is_active: bool = True) -> None:
+    def __init__(
+        self, *, user_id: uuid.UUID, is_active: bool = True, email_verified: bool = True
+    ) -> None:
         self.id = user_id
         self.is_active = is_active
         self.display_name = "Test User"
+        # A normal, usable account has a proven email; tests of the unverified
+        # case opt out explicitly (see `test_resolve_identity_rejects_unverified_user`).
+        self.email_verified_at = datetime.now(timezone.utc) if email_verified else None
 
 
 def _patch_resolve_identity_dependencies(
@@ -277,3 +283,66 @@ async def test_list_organization_members_maps_rows_to_schema(monkeypatch) -> Non
     assert result[0].id == row.id
     assert result[0].email == "a@example.com"
     assert result[0].roles == ("member", "incident_commander")
+
+
+# --- email verification enforcement at the identity choke point ----------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_identity_rejects_an_unverified_user_even_with_a_valid_token(monkeypatch) -> None:
+    """`resolve_identity` runs on every REST and MCP request, so this is what cuts off
+    access tokens that were issued before verification existed (or to a legacy,
+    never-verified account) -- no roles or permissions are even loaded."""
+    organization_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    call_order: list[str] = []
+    _patch_resolve_identity_dependencies(
+        monkeypatch,
+        user_row=_FakeUserRow(user_id=user_id, email_verified=False),
+        organization_id=organization_id,
+        user_id=user_id,
+        role_names=["admin"],
+        permission_codes={"tenancy:manage"},
+        call_order=call_order,
+    )
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await users_service.resolve_identity(None, user_id, organization_id)
+
+    assert exc_info.value.error_code == "auth.email_not_verified"
+    assert "get_role_names" not in call_order and "get_permission_codes" not in call_order
+
+
+@pytest.mark.asyncio
+async def test_resolve_identity_inactive_check_still_comes_first(monkeypatch) -> None:
+    organization_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    _patch_resolve_identity_dependencies(
+        monkeypatch,
+        user_row=_FakeUserRow(user_id=user_id, is_active=False, email_verified=False),
+        organization_id=organization_id,
+        user_id=user_id,
+    )
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await users_service.resolve_identity(None, user_id, organization_id)
+
+    assert exc_info.value.error_code == "user.inactive"
+
+
+@pytest.mark.asyncio
+async def test_resolve_identity_still_resolves_a_verified_user(monkeypatch) -> None:
+    organization_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    _patch_resolve_identity_dependencies(
+        monkeypatch,
+        user_row=_FakeUserRow(user_id=user_id),
+        organization_id=organization_id,
+        user_id=user_id,
+        role_names=["admin"],
+        permission_codes={"tenancy:manage"},
+    )
+
+    identity = await users_service.resolve_identity(None, user_id, organization_id)
+
+    assert identity.has_permission("tenancy:manage")

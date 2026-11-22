@@ -1,40 +1,27 @@
 import { apiRequest, mockDelay } from "./client";
 import { USE_MOCK_DATA } from "./config";
-import type { McpTool } from "@/types/mcp";
-import { mockMcpTools } from "@/mocks/data/mcp";
+import type { McpToolDefinition, McpToolUsage } from "@/types/mcp";
+import { mockMcpToolCatalogue, mockMcpToolUsage } from "@/mocks/data/mcp";
 
 /**
- * Matches `app.core.observability.schemas.McpToolStats` field-for-field
- * (after `apiRequest`'s automatic snake_case -> camelCase conversion) --
- * `GET /observability/mcp`'s real response shape. This is a usage-*stats*
- * aggregate, not a tool catalog: there is no real endpoint that returns
- * tool descriptions/parameter schemas/status (those only exist in mock
- * mode's illustrative `mockMcpTools`, per `McpTool`'s own doc comment) --
- * a previous version of this function returned `McpTool[]` directly for
- * real responses too, which silently didn't match at all (`tool_name` vs
- * `name`, no `parameters`/`status` field on the real response whatsoever).
+ * The tools the MCP server has registered, with descriptions and parameters
+ * (`GET /observability/mcp/tools`). In mock mode this is the snapshot generated
+ * from the real registration (`scripts/export_mcp_tool_catalogue.py`).
  */
-interface McpToolStatsResponse {
-  toolName: string;
-  requestCount: number;
-  errorCount: number;
-  avgLatencyMs: number | null;
-  maxLatencyMs: number | null;
+export async function listMcpToolCatalogue(): Promise<McpToolDefinition[]> {
+  if (USE_MOCK_DATA) {
+    return mockDelay(mockMcpToolCatalogue);
+  }
+  return apiRequest<McpToolDefinition[]>(`/observability/mcp/tools`);
 }
 
-export async function listMcpTools(): Promise<McpTool[]> {
+/**
+ * Recorded usage of MCP tools by the caller's organization
+ * (`GET /observability/mcp`). Statistics only -- not the catalogue.
+ */
+export async function listMcpToolUsage(): Promise<McpToolUsage[]> {
   if (USE_MOCK_DATA) {
-    return mockDelay(mockMcpTools);
+    return mockDelay(mockMcpToolUsage);
   }
-  const stats = await apiRequest<McpToolStatsResponse[]>(`/observability/mcp`);
-  // Maps only the fields that genuinely exist on the real response --
-  // `description`/`status`/`parameters` are left undefined (not fabricated
-  // placeholders), which `McpToolsPage` renders conditionally.
-  return stats.map((stat) => ({
-    name: stat.toolName,
-    avgLatencyMs: stat.avgLatencyMs ?? undefined,
-    callCountLast24h: stat.requestCount,
-    errorCount: stat.errorCount,
-    maxLatencyMs: stat.maxLatencyMs ?? undefined,
-  }));
+  return apiRequest<McpToolUsage[]>(`/observability/mcp`);
 }

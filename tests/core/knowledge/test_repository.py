@@ -135,6 +135,30 @@ async def test_list_published_documents_applies_limit_and_offset() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_published_documents_excludes_superseded_and_soft_deleted() -> None:
+    """A re-synced connector document is a new row per version; the browse
+    list must show only the current one (old rows stay in the table so their
+    ids keep resolving, they just aren't listed)."""
+    session = _CapturingSession()
+
+    await repository.list_published_documents(session, uuid.uuid4())
+
+    sql = _compile(session.statements[0]).lower().replace(" ", "")
+    assert "documents.superseded_atisnull" in sql
+    assert "documents.deleted_atisnull" in sql
+
+
+@pytest.mark.asyncio
+async def test_get_document_by_id_does_not_filter_superseded_rows() -> None:
+    """Citation integrity: `get_document_by_id` is `session.get` -- a
+    superseded version's id must keep resolving."""
+    import inspect
+
+    source = inspect.getsource(repository.get_document_by_id)
+    assert "superseded_at" not in source
+
+
+@pytest.mark.asyncio
 async def test_list_published_documents_defaults_to_fifty_and_zero() -> None:
     session = _CapturingSession()
 

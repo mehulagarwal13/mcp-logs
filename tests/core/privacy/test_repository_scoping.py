@@ -68,6 +68,7 @@ _MUTATIONS = [
     "delete_project_memberships",
     "delete_external_identity_mappings",
     "anonymize_agent_executions",
+    "delete_mcp_requests",
 ]
 
 

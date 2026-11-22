@@ -31,7 +31,9 @@ from __future__ import annotations
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import service as auth_service
+from app.core.exceptions import PermissionDeniedError
 from app.core.users import service as users_service
+from app.mcp.oauth.constants import MCP_SCOPE, mcp_resource_identifier
 from app.shared.schemas import Identity
 
 
@@ -46,5 +48,11 @@ async def resolve_mcp_identity(session: AsyncSession, raw_token: str) -> Identit
     MCP error response the same way every other module's callers let
     `EKIPError` subclasses propagate to their own boundary.
     """
-    claims = auth_service.verify_access_token(raw_token)
+    resource = mcp_resource_identifier()
+    claims = auth_service.verify_access_token(raw_token, audience=resource, issuer=resource)
+    if MCP_SCOPE not in claims.scopes:
+        raise PermissionDeniedError(
+            f"Connected token lacks required '{MCP_SCOPE}' scope.",
+            error_code="auth.insufficient_scope",
+        )
     return await users_service.resolve_identity(session, claims.user_id, claims.organization_id)

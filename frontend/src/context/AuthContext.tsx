@@ -32,6 +32,9 @@ interface AuthContextValue {
   user: AuthUser | null;
   isAuthenticated: boolean;
   isLoading: boolean;
+  // Email verification: signup creates nothing and starts no session -- it
+  // only asks the backend to email a confirmation link. Resolving means "the
+  // request was accepted", never "the user is signed in".
   signup: (payload: SignupPayload) => Promise<void>;
   login: (payload: LoginPayload) => Promise<LoginOutcome>;
   // Completes a multi-organization login after the caller shows the user
@@ -97,12 +100,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [loadUserFromAccessToken],
   );
 
-  const handleSignup = useCallback(
-    async (payload: SignupPayload) => {
-      await applySession(await authApi.signup(payload));
-    },
-    [applySession],
-  );
+  const handleSignup = useCallback(async (payload: SignupPayload) => {
+    await authApi.signup(payload);
+  }, []);
 
   const handleLogin = useCallback(
     async (payload: LoginPayload): Promise<LoginOutcome> => {
@@ -140,9 +140,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const handleAcceptInvitation = useCallback(
     async (invitationId: string, payload: InvitationAcceptPayload) => {
-      await applySession(await authApi.acceptInvitation(invitationId, payload));
+      // No session: acceptance completes when the emailed link is opened.
+      await authApi.acceptInvitation(invitationId, payload);
     },
-    [applySession],
+    [],
   );
 
   const handleLogout = useCallback(async () => {

@@ -263,6 +263,9 @@ class TokenClaims(BaseModel):
     organization_id: uuid.UUID
     issued_at: datetime
     expires_at: datetime
+    #: OAuth scopes carried by the token (`scope` claim, space-separated in the
+    #: JWT). Empty for an ordinary REST session token.
+    scopes: tuple[str, ...] = ()
 
 
 class VerifiedIdPClaims(BaseModel):
@@ -293,3 +296,45 @@ class VerifiedIdPClaims(BaseModel):
     email: str
     name: str | None = None
     groups: tuple[str, ...] = ()
+    #: True ONLY if the IdP affirmatively proved this email's ownership under
+    #: that provider's rules (`core.auth.service._idp_email_verification`).
+    #: Defaults to False (fail closed): a claims object built without the
+    #: evidence can never provision, match an invitation, or link an account.
+    email_verified: bool = False
+    #: Which claim supplied the evidence (`email_verified` / `xms_edov`), for
+    #: audit logs only.
+    email_verification_source: str | None = None
+
+
+class VerificationRequested(BaseModel):
+    """Generic acknowledgement for signup, invitation acceptance and resend.
+
+    Deliberately identical whether or not a message was actually sent (an
+    address that already has an account, or a rate-limited resend, produce
+    the same body) so these endpoints cannot be used to enumerate accounts.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    status: Literal["verification_sent"] = "verification_sent"
+    message: str = (
+        "If this address can be used, a confirmation email is on its way. "
+        "Open the link in it to continue."
+    )
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=512)
+
+
+class VerifyEmailResponse(BaseModel):
+    """Result of consuming a verification token. Carries NO session: the
+    user signs in through the normal login endpoint afterwards."""
+
+    model_config = ConfigDict(frozen=True)
+
+    status: Literal["verified"] = "verified"
+
+
+class ResendVerificationRequest(BaseModel):
+    email: str = Field(max_length=320)

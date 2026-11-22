@@ -49,12 +49,11 @@ export async function signupViaUI(
   await page.getByLabel("Organization name").fill(data.orgName);
   await page.getByLabel("Organization URL slug").fill(data.orgSlug);
   await page.getByRole("button", { name: "Create account" }).click();
-  // `signup` is a genuinely heavy operation (new org + project + user +
-  // password hash + role/permission bootstrap + session issuance, ~15-20
-  // sequential queries) -- observed at ~9-10s end-to-end against this
-  // environment's real remote dev database, so this needs real headroom,
-  // not the fast ~1-2s a plain login takes.
-  await expect(page).not.toHaveURL(/\/signup$/, { timeout: 30_000 });
+  // Email verification: signup no longer creates anything or starts a
+  // session -- it records a pending registration and emails a link. The
+  // success state is the "Check your email" screen; the account (org, admin
+  // user, role) is created when that link is opened (see `fixtures/mail.ts`).
+  await expect(page.getByRole("heading", { name: "Check your email" })).toBeVisible({ timeout: 30_000 });
 }
 
 export async function logoutViaUI(page: Page): Promise<void> {

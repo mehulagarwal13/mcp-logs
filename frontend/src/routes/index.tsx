@@ -6,6 +6,7 @@ import { ProtectedRoute } from "./ProtectedRoute";
 import { AcceptInvitationPage } from "@/pages/auth/AcceptInvitationPage";
 import { LoginPage } from "@/pages/auth/LoginPage";
 import { SignupPage } from "@/pages/auth/SignupPage";
+import { VerifyEmailPage } from "@/pages/auth/VerifyEmailPage";
 import { AboutPage } from "@/pages/about/AboutPage";
 import { AskPage } from "@/pages/ask/AskPage";
 import { DashboardPage } from "@/pages/dashboard/DashboardPage";
@@ -39,6 +40,7 @@ export const router = createBrowserRouter([
     children: [
       { path: "/login", element: <LoginPage /> },
       { path: "/signup", element: <SignupPage /> },
+      { path: "/verify-email", element: <VerifyEmailPage /> },
       { path: "/invitations/:invitationId/accept", element: <AcceptInvitationPage /> },
     ],
   },

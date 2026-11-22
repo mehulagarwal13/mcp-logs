@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from app.api import main as api_main
 from app.api.deps import get_arq_pool, get_current_identity
 from app.api.routers import tenancy as tenancy_router
-from app.core.auth.schemas import SessionTokens
+from app.core.auth import email_verification
 from app.core.tenancy.schemas import (
     AccessRule,
     ConnectorConfig,
@@ -507,42 +507,50 @@ def test_accept_invitation_requires_no_authentication(client, monkeypatch) -> No
     `client` fixture purely for its `TestClient`; the identity override in
     play is simply never consulted by this endpoint.
 
-    Phase 7.5: the endpoint now delegates to `auth_service.
-    accept_invitation_with_password` (not `tenancy_service.accept_invitation`
-    directly) and requires a `token`/`password` body, returning `SessionTokens`
-    rather than 204.
+    Email verification: the endpoint now only STARTS acceptance. It answers 202
+    with a generic body and NO tokens (the invitation token is admin-visible, so
+    it is not proof of mailbox control); the confirmation mail is sent after the
+    response and the user is created when its link is opened.
     """
     test_client, _actor = client
     invitation_id = uuid.uuid4()
     captured: dict[str, object] = {}
+    delivered: list[object] = []
 
     async def fake_accept_invitation_with_password(session, passed_invitation_id, data):
         captured["invitation_id"] = passed_invitation_id
         captured["data"] = data
-        return SessionTokens(
-            access_token="access-token",
-            refresh_token="refresh-token",
-            expires_in=900,
+        return email_verification.PendingDelivery(
+            uuid.uuid4(), "invitation", "invitee@example.com", "raw-verification-token"
         )
+
+    async def fake_deliver(delivery, **kwargs):
+        delivered.append(delivery)
 
     monkeypatch.setattr(
         tenancy_router.auth_service,
         "accept_invitation_with_password",
         fake_accept_invitation_with_password,
     )
+    monkeypatch.setattr(
+        tenancy_router.email_verification, "deliver_verification_email", fake_deliver
+    )
+    monkeypatch.setattr("app.api.deps.email_delivery_configured", lambda: True)
 
     response = test_client.post(
         f"/invitations/{invitation_id}/accept",
         json={"token": "raw-token", "password": "correct horse battery staple"},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     body = response.json()
-    assert body["access_token"] == "access-token"
-    assert body["refresh_token"] == "refresh-token"
+    assert body["status"] == "verification_sent"
+    assert "access_token" not in body and "refresh_token" not in body
+    assert "raw-verification-token" not in response.text  # the token never reaches the API response
     assert captured["invitation_id"] == invitation_id
     assert captured["data"].token == "raw-token"
     assert captured["data"].password == "correct horse battery staple"
+    assert len(delivered) == 1  # the mail is scheduled after the response
 
 
 def test_revoke_invitation_uses_callers_own_organization(client, monkeypatch) -> None:

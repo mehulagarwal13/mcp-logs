@@ -137,7 +137,10 @@ async def main() -> None:
         print(f"Admin role ready: {role.id} (granting {len(permissions)} permissions)")
 
         user_id = await users_service.get_or_create_user(
-            session, email=_TEST_USER_EMAIL, display_name=_TEST_USER_DISPLAY_NAME
+            session,
+            email=_TEST_USER_EMAIL,
+            display_name=_TEST_USER_DISPLAY_NAME,
+            email_verified_via="operator_attestation",  # dev bootstrap: trusted, explicit
         )
         print(f"Test user ready: {user_id} ({_TEST_USER_EMAIL})")
 

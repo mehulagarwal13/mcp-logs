@@ -36,10 +36,25 @@ AUTHORIZATION
     permission and the same helper every other admin-scoped operation in
     this codebase uses (`configure_sso`, `create_project`,
     `revoke_all_sessions`'s API caller). No new permission code and no
-    second authorization concept is introduced. Cross-tenant deletion is
-    structurally impossible: every repository statement is scoped by
-    `organization_id` as well as `user_id`, and the organization used is
-    always `actor.organization_id`, never a caller-supplied value.
+    second authorization concept is introduced. The organization used is
+    always `actor.organization_id`, never a caller-supplied value, and every
+    org-scoped repository statement is scoped by it as well as `user_id`.
+
+    SAFEGUARDS (added after the member-management audit; all enforced in
+    `plan_user_data_deletion`, so the dry run and the real run agree):
+      * The target must be a CURRENT member of the actor's organization
+        (holds a role there). Anyone else -- another organization's user, or
+        an id that does not exist -- gets the identical "no such user" 404,
+        so the endpoint cannot be used to probe or damage other tenants.
+        `users` is a global table without RLS, so this check is what keeps
+        the global-account step from reaching across tenants.
+      * An admin may not run it on themselves, even if another admin exists.
+      * It may not remove the organization's last admin (re-checked under a
+        per-organization lock at execution time -- see
+        `users_service.assert_organization_keeps_an_admin`).
+      * The global `users` record is anonymized only when the person has no
+        role left in ANY organization; otherwise only this organization's
+        access and data are removed and the account survives.
 """
 
 from __future__ import annotations
@@ -62,6 +77,7 @@ from app.core.privacy.schemas import (
     PlannedStep,
     StepResult,
 )
+from app.core.users import service as users_service
 from app.core.users.service import require_permission
 from app.shared.config.logging import get_logger
 from app.shared.schemas import Identity
@@ -96,12 +112,42 @@ async def plan_user_data_deletion(
     require_permission(actor, _MANAGE_PERMISSION)
     organization_id = actor.organization_id
 
-    if not await repository.user_exists(session, user_id):
+    # Self-deletion is blocked outright on this admin endpoint. A person who
+    # wants their own data erased asks another admin (or, in future, a
+    # dedicated self-service flow with its own re-authentication).
+    if actor.user_id is not None and user_id == actor.user_id:
+        raise ValidationError(
+            "You cannot delete your own data through the admin endpoint. "
+            "Ask another organization admin to do it.",
+            error_code="privacy.cannot_delete_self",
+        )
+
+    # The target must be a current member of THIS organization. A non-member
+    # and a nonexistent user get the same answer on purpose (no existence
+    # oracle across tenants), and no mutation can happen for either.
+    if not await repository.user_exists(session, user_id) or not await (
+        users_service.is_organization_member(session, user_id, organization_id)
+    ):
         raise NotFoundError(
             "No such user.",
             error_code="privacy.user_not_found",
             detail={"user_id": str(user_id)},
         )
+
+    # Dry-run form: no locks on a read-only request. Execution repeats this
+    # check under a lock.
+    await users_service.assert_organization_keeps_an_admin(
+        session, organization_id, user_id, lock=False
+    )
+
+    # Does the person belong to any OTHER organization? If so their global
+    # account must survive (see the `user_record` step below).
+    other_organization_ids = [
+        org_id
+        for org_id in await users_service.list_organizations_for_login(session, user_id)
+        if org_id != organization_id
+    ]
+    account_is_shared = bool(other_organization_ids)
 
     email = await repository.get_user_email(session, user_id)
     invitation_count = (
@@ -168,6 +214,19 @@ async def plan_user_data_deletion(
             ),
         ),
         PlannedStep(
+            category="mcp_request_history",
+            action="hard_delete",
+            table="mcp_requests",
+            count=await repository.count_mcp_requests(session, user_id, organization_id),
+            rationale=(
+                "Per-call MCP telemetry tagged with this person's 'user:<uuid>' "
+                "actor. No organization-level value in a departed person's call "
+                "history (unlike agent execution cost telemetry), so it is "
+                "deleted in this organization. Unattributed legacy rows are "
+                "removed by the retention purge instead."
+            ),
+        ),
+        PlannedStep(
             category="user_private_memory",
             action="hard_delete",
             table="agent_memories",
@@ -197,15 +256,20 @@ async def plan_user_data_deletion(
         ),
         PlannedStep(
             category="user_record",
-            action="anonymize",
+            action="retain" if account_is_shared else "anonymize",
             table="users",
-            count=1,
+            count=0 if account_is_shared else 1,
             rationale=(
-                "Cannot be deleted: incidents.reported_by, postmortems.reviewed_by "
+                "This person also belongs to other organizations, so their global "
+                "account (email, name, password, active flag) is left untouched; "
+                "only this organization's access and data are removed."
+                if account_is_shared
+                else "Cannot be deleted: incidents.reported_by, postmortems.reviewed_by "
                 "and invitations.invited_by are all ON DELETE RESTRICT. Email, "
                 "display name and password hash are cleared and is_active set false "
                 "-- which also neutralizes every 'user:<uuid>' tagged-actor string "
-                "elsewhere, since they all dereference to this row."
+                "elsewhere, since they all dereference to this row. Only done because "
+                "the person belongs to no other organization."
             ),
         ),
         PlannedStep(
@@ -265,14 +329,16 @@ async def execute_user_data_deletion(
     """Execute the plan from `plan_user_data_deletion`, returning a per-step
     result.
 
-    IDEMPOTENCY. Safe to re-run. Every mutation is a `DELETE/UPDATE ... WHERE`
-    that matches zero rows once it has already been applied, so a second run
-    reports `rows_affected=0` per step and succeeds. `was_noop` is set when
-    the user record was already anonymized on entry -- that is the one signal
-    that distinguishes "this run did the work" from "a previous run already
-    had", which a bare count of zero cannot express. Note the deliberate
-    asymmetry: re-running is *not* treated as an error, because a retry after
-    a partial failure is exactly the intended recovery path.
+    IDEMPOTENCY AND RECOVERY. Every mutation is a `DELETE/UPDATE ... WHERE`
+    that matches zero rows once applied. The target must be a CURRENT member,
+    so the membership (`user_roles`) is deliberately removed LAST: if any
+    earlier cleanup step fails, the global account is not anonymized and the
+    membership is kept, the result reports the failure
+    (`partially_completed`), and the identical request can be retried. Only a
+    fully completed run leaves the person a non-member, after which a repeat
+    call answers "no such user" (404) -- there is nothing left this
+    organization may act on. `was_noop` is kept for an already-anonymized
+    user who still holds a role.
 
     PARTIAL FAILURE. Each step is executed independently and its outcome
     recorded. If any step raises, that step is marked failed and the
@@ -294,6 +360,31 @@ async def execute_user_data_deletion(
     _assert_scope_supported(scope)
     plan = await plan_user_data_deletion(session, actor, user_id, scope=scope)
     organization_id = actor.organization_id
+
+    # Re-check the last-admin rule under the per-organization admin lock,
+    # BEFORE any mutation, so a concurrent request cannot invalidate it
+    # between the dry-run read above and the deletes below.
+    await users_service.assert_organization_keeps_an_admin(
+        session, organization_id, user_id, lock=True
+    )
+
+    # Then lock the person's global account row. This serializes two
+    # organizations deleting the same multi-organization person, and blocks
+    # `assign_role` (invitation accept / SSO provisioning) for them until we
+    # commit. Everything decided below is decided AFTER both locks are held.
+    user_exists_now = await users_service.lock_user_for_deletion(session, user_id)
+
+    # Membership is re-verified under the locks: the plan's check ran before
+    # them, and the person may have been removed in between by a concurrent
+    # request. Same refusal as the plan's, so nothing is revealed.
+    if not user_exists_now or not await users_service.is_organization_member(
+        session, user_id, organization_id
+    ):
+        raise NotFoundError(
+            "No such user.",
+            error_code="privacy.user_not_found",
+            detail={"user_id": str(user_id)},
+        )
 
     already_anonymized = await repository.is_user_anonymized(session, user_id)
     email = await repository.get_user_email(session, user_id)
@@ -330,11 +421,6 @@ async def execute_user_data_deletion(
 
     await _run("sessions", "hard_delete", _revoke_then_delete_sessions)
     await _run(
-        "organization_roles",
-        "hard_delete",
-        lambda: repository.delete_user_roles(session, user_id, organization_id),
-    )
-    await _run(
         "project_memberships",
         "hard_delete",
         lambda: repository.delete_project_memberships(session, user_id, organization_id),
@@ -348,6 +434,11 @@ async def execute_user_data_deletion(
         "agent_execution_history",
         "anonymize",
         lambda: repository.anonymize_agent_executions(session, user_id, organization_id),
+    )
+    await _run(
+        "mcp_request_history",
+        "hard_delete",
+        lambda: repository.delete_mcp_requests(session, user_id, organization_id),
     )
     await _run(
         "user_private_memory",
@@ -375,11 +466,106 @@ async def execute_user_data_deletion(
                 category="invitations_received", action="anonymize", succeeded=True, rows_affected=0
             )
         )
-    await _run(
-        "user_record",
-        "anonymize",
-        lambda: repository.anonymize_user_record(session, user_id),
+    # ---- Membership goes LAST, atomically with the account decision ---------
+    # Holding a role in this organization is what lets an admin retry (the
+    # target must be a current member). So the role is deleted only after every
+    # other cleanup step succeeded; if any earlier step failed, neither the
+    # global account nor the membership is touched, the failure is reported, and
+    # the same request can simply be repeated.
+    earlier_failed = any(not step.succeeded for step in steps)
+    held_back = (
+        "Skipped because an earlier cleanup step failed; membership was kept so "
+        "this deletion can be retried."
     )
+
+    # The global account is anonymized only if the person belongs to no OTHER
+    # organization. Evaluated here, under the user-row lock, from the current
+    # database state -- not from the plan -- so it reflects concurrent changes
+    # (another organization's deletion, a membership granted elsewhere).
+    account_retained = False
+
+    async def _anonymize_account_if_unshared() -> int:
+        nonlocal account_retained
+        organizations = await users_service.list_organizations_for_login(session, user_id)
+        if any(org_id != organization_id for org_id in organizations):
+            account_retained = True
+            return 0
+        return await repository.anonymize_user_record(session, user_id)
+
+    if earlier_failed:
+        steps.append(
+            StepResult(category="user_record", action="anonymize", succeeded=False, error=held_back)
+        )
+        steps.append(
+            StepResult(
+                category="organization_roles",
+                action="hard_delete",
+                succeeded=False,
+                error=held_back,
+            )
+        )
+    else:
+        # The account decision/anonymization and the membership deletion run in
+        # ONE savepoint: either both are applied or neither is. The try/except
+        # is deliberately OUTSIDE the `async with`, so the exception leaves the
+        # savepoint context (rolling it back) before it is caught and recorded.
+        stage = "user_record"
+        try:
+            async with _atomic(session):
+                account_rows = await _anonymize_account_if_unshared()
+                stage = "organization_roles"
+                role_rows = await repository.delete_user_roles(session, user_id, organization_id)
+        except Exception as exc:  # noqa: BLE001 -- recorded, not swallowed: see below
+            account_retained = False  # the savepoint undid whatever the decision led to
+            logger.warning(
+                "privacy_deletion_final_steps_rolled_back",
+                failed_step=stage,
+                target_user_id=str(user_id),
+                organization_id=str(organization_id),
+                error=str(exc),
+            )
+            rolled_back = (
+                "Rolled back together with {other} (the final two steps are atomic); "
+                "the account and the membership are unchanged and the request can be retried."
+            )
+            for category, action in (
+                ("user_record", "anonymize"),
+                ("organization_roles", "hard_delete"),
+            ):
+                failed_here = category == stage
+                steps.append(
+                    StepResult(
+                        category=category,
+                        action=action,
+                        succeeded=False,
+                        error=(
+                            str(exc)
+                            if failed_here
+                            else rolled_back.format(
+                                other="organization_roles"
+                                if category == "user_record"
+                                else "user_record"
+                            )
+                        ),
+                    )
+                )
+        else:
+            steps.append(
+                StepResult(
+                    category="user_record",
+                    action="retain" if account_retained else "anonymize",
+                    succeeded=True,
+                    rows_affected=account_rows,
+                )
+            )
+            steps.append(
+                StepResult(
+                    category="organization_roles",
+                    action="hard_delete",
+                    succeeded=True,
+                    rows_affected=role_rows,
+                )
+            )
 
     status = _derive_status(steps)
     result = DeletionResult(
@@ -411,6 +597,7 @@ async def execute_user_data_deletion(
             "anonymized_rows": result.anonymized_row_count,
             "failed_steps": [s.category for s in result.failed_steps],
             "was_noop": already_anonymized,
+            "account_retained_other_organizations": account_retained,
             "retained_categories": [s.category for s in plan.retain_steps],
         },
     )
@@ -425,6 +612,22 @@ async def execute_user_data_deletion(
         was_noop=already_anonymized,
     )
     return result
+
+
+def _atomic(session: AsyncSession):
+    """A SAVEPOINT around the final two steps (global-account anonymization and
+    membership removal) so they succeed or fail TOGETHER.
+
+    Without it, `_run` would record a failure of the second step while the
+    first stays applied -- an anonymized account that still holds its
+    organization membership. Used as `async with _atomic(session):` with the
+    caller's `try/except` OUTSIDE the block, so the exception propagates through
+    the context manager and the savepoint is rolled back BEFORE it is caught.
+    A rolled-back savepoint also restores a usable transaction after a
+    PostgreSQL error, which a bare caught exception would not. A separate
+    function so unit tests with no real session can substitute it.
+    """
+    return session.begin_nested()
 
 
 def _derive_status(steps: list[StepResult]) -> DeletionStatus:

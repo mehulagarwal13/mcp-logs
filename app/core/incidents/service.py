@@ -307,12 +307,22 @@ async def record_investigation_result(
     so they can be used later by the Postmortem Agent to identify the root cause. It 
     stores evidence, hypotheses, suggested teams, next steps, and review/critique results 
     as JSON, making the timeline a permanent record without needing to fetch data from 
-    another table. It doesn’t check permissions again because the agent action was 
-    already authorized, and it stores only structured critique tags, not the model’s raw 
+    another table. It stores only structured critique tags, not the model’s raw
     reasoning.
+
+    Authorization: `actor` must belong to `organization_id`, the incident must
+    belong to that organization (else `NotFoundError`), and `actor` must hold
+    `incident:read` on the incident's project (else `PermissionDeniedError`) --
+    the same rule `get_incident`/`triage_incident` apply. Read, not write, is
+    deliberate: automated investigation results are recorded on behalf of
+    read-authorized investigators, who are allowed to run an investigation.
+    This is enforced here, not merely trusted from the caller, so a future
+    caller cannot write to a timeline its actor could not read. Manual notes
+    remain separately gated by `incident:write` (`add_timeline_note`).
     """
     _ensure_same_organization(actor, organization_id)
-    await _get_owned_incident(session, organization_id, incident_id)
+    incident = await _get_owned_incident(session, organization_id, incident_id)
+    require_project_permission(actor, incident.project_id, _INCIDENT_READ_PERMISSION)
 
     event_data = {
         "evidence": [item.model_dump(mode="json") for item in investigation.evidence],
@@ -323,6 +333,14 @@ async def record_investigation_result(
         "critique_verdict": investigation.critique_verdict,
         "revision_count": investigation.revision_count,
         "critique_issues": investigation.critique_issues,
+        # Whether live GitHub/Slack evidence was collected -- so a later
+        # reader of the timeline can tell a thin result from a complete one.
+        # Status codes only; never credentials or exception text.
+        "live_evidence": (
+            investigation.live_evidence.model_dump(mode="json")
+            if investigation.live_evidence is not None
+            else None
+        ),
     }
     row = await repository.insert_timeline_entry(
         session,

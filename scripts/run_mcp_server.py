@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from urllib.parse import urlsplit
 
+import uvicorn
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.applications import Starlette
 
 from app.database.session import session_scope, set_tenant_context
+from app.mcp.oauth.registration_guard import RegistrationRateLimitMiddleware
 from app.mcp.servers import main as mcp_assembly
 from app.mcp.servers import server as server_module
 from app.shared.config.logging import configure_logging, get_logger
@@ -88,6 +92,43 @@ def resolve_port() -> int:
     return int(os.environ.get("PORT") or get_settings().mcp_port)
 
 
+async def publish_tool_catalogue() -> None:
+    """Publish this server's registered tools so the API can show the real
+    catalogue. Best effort: a failure is logged and never stops the server.
+
+    Runs in its own short event loop before uvicorn starts, so the shared engine's
+    pooled connections are disposed afterwards (they belong to this loop).
+    """
+    from app.core.observability import service as observability_service
+    from app.database.session import engine
+    from app.mcp.catalogue import describe_registered_tools
+
+    try:
+        tools = await describe_registered_tools(server_module.mcp_server)
+        async with session_scope() as session:
+            count = await observability_service.sync_mcp_tool_catalogue(session, tools)
+        logger.info("mcp_tool_catalogue_published", tools=count)
+    except Exception as exc:  # noqa: BLE001 -- must never prevent the server starting
+        logger.warning("mcp_tool_catalogue_publish_failed", error=str(exc))
+    finally:
+        await engine.dispose()
+
+
+def build_app(host: str, transport_security: TransportSecuritySettings) -> Starlette:
+    """The streamable-HTTP ASGI app `MCPServer.run()` would serve, with the
+    unauthenticated `/register` endpoint throttled per caller IP (the SDK has
+    no hook for that, so it is a middleware in front of the SDK's own app).
+    """
+    app = server_module.mcp_server.streamable_http_app(
+        host=host, transport_security=transport_security
+    )
+    app.add_middleware(
+        RegistrationRateLimitMiddleware,
+        per_ip_per_hour=get_settings().mcp_oauth_registration_per_ip_per_hour,
+    )
+    return app
+
+
 if __name__ == "__main__":
     # `app.mcp.servers.server`'s OAuth wiring (`AuthSettings.issuer_url`/
     # `resource_server_url`, for Claude's remote-connector OAuth flow) reads
@@ -107,9 +148,10 @@ if __name__ == "__main__":
         allowed_hosts=allowed_hosts,
         public_base_url=get_settings().mcp_public_base_url,
     )
-    server_module.mcp_server.run(
-        transport="streamable-http",
+    asyncio.run(publish_tool_catalogue())
+    uvicorn.run(
+        build_app(host, transport_security),
         host=host,
         port=port,
-        transport_security=transport_security,
+        log_level=server_module.mcp_server.settings.log_level.lower(),
     )

@@ -97,9 +97,20 @@ _COMMAND_TIMEOUT_SECONDS = 30.0
 _POOL_RECYCLE_SECONDS = 1800
 
 
-def _build_engine(database_url: str | None = None) -> AsyncEngine:
+def _build_engine(
+    database_url: str | None = None,
+    *,
+    command_timeout: float | None = _COMMAND_TIMEOUT_SECONDS,
+) -> AsyncEngine:
     """Create an async engine from settings, or from `database_url` when
     given explicitly.
+
+    `command_timeout` is asyncpg's client-side per-command bound (default: the
+    30 s every request-serving engine uses). Only the migration engine passes
+    `None`: a long DDL statement such as `CREATE INDEX CONCURRENTLY ... USING
+    hnsw` on a populated table legitimately exceeds 30 s, and the client-side
+    timeout cancels it (leaving an INVALID index). `SET statement_timeout` is
+    server-side and does not affect this.
 
     Optional database URL override for this call, used by migrations to connect
     with the privileged migration role instead of the least-privileged runtime
@@ -125,7 +136,7 @@ def _build_engine(database_url: str | None = None) -> AsyncEngine:
         # where a non-SSL Postgres would fail outright with `ssl=True` forced.
         connect_args={
             "ssl": _ssl_connect_arg(url),
-            "command_timeout": _COMMAND_TIMEOUT_SECONDS,
+            "command_timeout": command_timeout,
         },
     )
 

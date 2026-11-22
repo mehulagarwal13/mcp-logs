@@ -188,7 +188,10 @@ async def bootstrap() -> tuple[Identity, uuid.UUID, list[uuid.UUID]]:
         org = await _get_or_create_organization(session)
 
         user_id = await users_service.get_or_create_user(
-            session, email=_ADMIN_EMAIL, display_name=_ADMIN_DISPLAY_NAME
+            session,
+            email=_ADMIN_EMAIL,
+            display_name=_ADMIN_DISPLAY_NAME,
+            email_verified_via="operator_attestation",  # dev bootstrap: trusted, explicit
         )
         await users_service.assign_role(
             session, user_id=user_id, organization_id=org.id, role_id=role_id

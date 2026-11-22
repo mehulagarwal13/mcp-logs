@@ -126,6 +126,7 @@ async def run_mcp_tool(
     start = time.monotonic()
     status_code = 200
     identity_tag = "unresolved"
+    organization_id: uuid.UUID | None = None
     outcome_error: BaseException | None = None
     # Phase 5.2: MCP's own request-correlation id -- there's no HTTP header
     # to accept one from the way `RequestContextMiddleware` does for REST,
@@ -141,6 +142,7 @@ async def run_mcp_tool(
         async with session_factory() as session:
             identity = await resolve_mcp_identity(session, raw_token)
             identity_tag = identity.audit_tag
+            organization_id = identity.organization_id
             structlog.contextvars.bind_contextvars(
                 organization_id=str(identity.organization_id),
                 user_id=str(identity.user_id) if identity.user_id else None,
@@ -176,8 +178,13 @@ async def run_mcp_tool(
         latency_ms = int((time.monotonic() - start) * 1000)
         try:
             async with session_factory() as log_session:
+                if organization_id is not None:
+                    # `mcp_requests` is row-level-secured: the log row can only
+                    # be written for the caller's own organization.
+                    await set_tenant_context(log_session, organization_id)
                 await observability_service.record_mcp_request(
                     log_session,
+                    organization_id=organization_id,
                     tool_name=tool_name,
                     identity=identity_tag,
                     request_summary=request_summary,

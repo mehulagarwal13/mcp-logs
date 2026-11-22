@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models.agent_models import AgentExecution
 from app.database.models.auth_models import RefreshToken
 from app.database.models.core_models import Incident, User, UserRole
+from app.database.models.mcp_models import McpRequest
 from app.database.models.tenancy_models import (
     ExternalIdentityMapping,
     Invitation,
@@ -101,6 +102,42 @@ async def count_external_identity_mappings(
         ExternalIdentityMapping.organization_id == organization_id,
     )
     return int((await session.execute(stmt)).scalar_one())
+
+
+def _mcp_request_identity(user_id: uuid.UUID) -> str:
+    """`mcp_requests.identity` is the tagged-actor string `Identity.audit_tag`
+    writes for a user: `user:<uuid>`."""
+    return f"user:{user_id}"
+
+
+async def count_mcp_requests(
+    session: AsyncSession, user_id: uuid.UUID, organization_id: uuid.UUID
+) -> int:
+    stmt = select(func.count()).select_from(McpRequest).where(
+        McpRequest.identity == _mcp_request_identity(user_id),
+        McpRequest.organization_id == organization_id,
+    )
+    return int((await session.execute(stmt)).scalar_one())
+
+
+async def delete_mcp_requests(
+    session: AsyncSession, user_id: uuid.UUID, organization_id: uuid.UUID
+) -> int:
+    """Hard-delete this user's MCP request log within this organization.
+
+    The rows are per-call telemetry whose only personal content is the tagged
+    actor and (before minimization) request text -- there is no organization-
+    level value in keeping a departed person's call history, unlike
+    `agent_executions` (cost/usage telemetry that is kept, anonymized). Rows
+    with no owning organization cannot be attributed to this organization and
+    are left to the retention purge.
+    """
+    stmt = sql_delete(McpRequest).where(
+        McpRequest.identity == _mcp_request_identity(user_id),
+        McpRequest.organization_id == organization_id,
+    )
+    result = await session.execute(stmt)
+    return result.rowcount or 0
 
 
 async def count_agent_executions(

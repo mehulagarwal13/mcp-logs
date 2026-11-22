@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 
 import pytest
 
-from app.core.exceptions import NotFoundError, RateLimitedError
+from app.core.exceptions import NotFoundError, PermissionDeniedError, RateLimitedError
 from app.mcp import dispatch as dispatch_module
 from app.mcp import rate_limit as rate_limit_module
 from app.mcp.dispatch import McpServerNotReadyError, run_mcp_tool
@@ -149,8 +149,10 @@ async def test_sets_tenant_context_before_calling_handler(fake_identity) -> None
         tool_name="ask_question", raw_token="a-valid-token", request_summary={}, handler=handler
     )
     assert result == "ok"
-    assert len(calls) == 1
-    assert calls[0][1] == fake_identity.organization_id
+    # One call for the request session (before the handler) and one for the
+    # separate log session (`mcp_requests` is row-level secured).
+    assert len(calls) == 2
+    assert all(call[1] == fake_identity.organization_id for call in calls)
 
 
 @pytest.mark.asyncio
@@ -270,3 +272,74 @@ async def test_logging_failure_is_swallowed_not_raised(fake_identity, monkeypatc
         tool_name="ask_question", raw_token="a-valid-token", request_summary={}, handler=handler
     )
     assert result == "ok"
+
+
+@pytest.mark.asyncio
+async def test_log_row_is_attributed_to_the_callers_organization_with_tenant_context(
+    fake_identity, fake_observability
+) -> None:
+    """`mcp_requests` is row-level secured: the log write must carry the
+    caller's organization AND run in a session whose tenant context is that
+    organization (set before the insert)."""
+    server_module.session_factory = _fake_session_factory
+    events: list[tuple[str, object]] = []
+
+    async def recording_set_tenant_context(session, organization_id) -> None:
+        events.append(("set_tenant_context", organization_id))
+
+    server_module.set_tenant_context = recording_set_tenant_context
+
+    async def fake_record(session, **kwargs):
+        events.append(("record", kwargs["organization_id"]))
+
+    original = dispatch_module.observability_service.record_mcp_request
+    dispatch_module.observability_service.record_mcp_request = fake_record
+    try:
+
+        async def handler(session, identity):
+            return "ok"
+
+        await run_mcp_tool(
+            tool_name="create_project",
+            raw_token="a-valid-token",
+            request_summary={},
+            handler=handler,
+        )
+    finally:
+        dispatch_module.observability_service.record_mcp_request = original
+
+    # the last two events are the log session's: context first, then the insert
+    assert events[-2:] == [
+        ("set_tenant_context", fake_identity.organization_id),
+        ("record", fake_identity.organization_id),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_fails_before_identity_is_logged_unattributed_without_context(
+    fake_observability, monkeypatch
+) -> None:
+    server_module.session_factory = _fake_session_factory
+    contexts: list[object] = []
+
+    async def recording_set_tenant_context(session, organization_id) -> None:
+        contexts.append(organization_id)
+
+    server_module.set_tenant_context = recording_set_tenant_context
+
+    async def failing_resolve(session, raw_token):
+        raise PermissionDeniedError("bad token", error_code="auth.invalid_token")
+
+    monkeypatch.setattr(dispatch_module, "resolve_mcp_identity", failing_resolve)
+
+    async def handler(session, identity):
+        return "unreachable"
+
+    with pytest.raises(PermissionDeniedError):
+        await run_mcp_tool(
+            tool_name="ask_question", raw_token="x", request_summary={}, handler=handler
+        )
+
+    assert fake_observability[-1]["organization_id"] is None
+    assert fake_observability[-1]["identity"] == "unresolved"
+    assert contexts == []  # no organization is known, so no tenant context is set

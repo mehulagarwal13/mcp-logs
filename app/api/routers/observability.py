@@ -15,11 +15,10 @@ straight through as a `datetime` (FastAPI/Pydantic parses an ISO 8601 query
 string automatically); omitting it means "all time," matching each service
 function's own `since: datetime | None = None` default.
 
-`/observability/mcp` deliberately takes no `organization_id`-shaped
-path/query parameter at all, unlike every other router in this package --
-see `core.observability.service.get_mcp_dashboard`'s own docstring for why
-(`mcp_requests` carries no `organization_id` column; this is a genuinely
-platform-wide view, not an oversight in this router).
+`/observability/mcp` takes no `organization_id` parameter: it aggregates the
+caller's own organization (taken from their identity, never from the request)
+-- see `core.observability.service.get_mcp_dashboard`. `/observability/mcp/tools`
+is the registered-tool catalogue, a different thing from those statistics.
 """
 
 from __future__ import annotations
@@ -33,7 +32,7 @@ from app.agents import service as agents_service
 from app.agents.schemas import AgentExecutionStats
 from app.api.deps import ArqPool, CurrentIdentity, DbSession
 from app.core.observability import service as observability_service
-from app.core.observability.schemas import McpToolStats
+from app.core.observability.schemas import McpToolDefinition, McpToolStats
 from app.core.tenancy import service as tenancy_service
 from app.core.tenancy.schemas import IngestionJobStats, IngestionQueueHealth
 from app.core.users.service import require_permission
@@ -58,6 +57,17 @@ async def get_mcp_dashboard(
     since: datetime | None = None,
 ) -> list[McpToolStats]:
     return await observability_service.get_mcp_dashboard(session, actor, since=since)
+
+
+@router.get("/mcp/tools", response_model=list[McpToolDefinition])
+async def list_mcp_tool_catalogue(
+    actor: CurrentIdentity,
+    session: DbSession,
+) -> list[McpToolDefinition]:
+    """The MCP tools the server has registered (names, descriptions, input
+    schemas, parameters) -- the catalogue, as opposed to `/observability/mcp`'s
+    usage statistics."""
+    return await observability_service.list_mcp_tool_catalogue(session, actor)
 
 
 @router.get("/ingestion", response_model=list[IngestionJobStats])

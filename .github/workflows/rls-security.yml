@@ -91,6 +91,18 @@ jobs:
         # all) -- see that script's own docstring for the full contract.
         run: uv run python scripts/verify_rls_isolation.py
 
+      - name: Email-verification security tests (real Postgres, ekip_app)
+        # Single-use token consumption, concurrency, the unauthenticated
+        # invitation path (SECURITY DEFINER resolver) and RLS/grant
+        # invariants are database behaviour -- they only mean something
+        # against real Postgres as the real runtime role, so they run here,
+        # not in the mocked tier. Both URLs are this job's own local,
+        # disposable database (the tests refuse non-loopback hosts).
+        env:
+          EKIP_TEST_POSTGRES_URL: postgresql+asyncpg://ekip:ekip_ci_only@127.0.0.1:5432/ekip_rls_ci?sslmode=disable
+          EKIP_TEST_APP_URL: postgresql+asyncpg://ekip_app:ci-only-placeholder-ekip-app-password-not-a-real-secret@127.0.0.1:5432/ekip_rls_ci?sslmode=disable
+        run: uv run pytest tests/core/auth/test_email_verification_postgres.py -q
+
       - name: Summary
         if: always()
         run: |

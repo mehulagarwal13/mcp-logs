@@ -110,6 +110,16 @@ def test_kms_provider_local_requires_connector_secret_master_key(monkeypatch) ->
         Settings()
 
 
+def _set_valid_production_email_env(monkeypatch) -> None:
+    """Production now also requires working email delivery (email verification
+    is always enforced). The KMS tests below are about KMS, so they supply a
+    valid email configuration to keep that the only thing under test."""
+    monkeypatch.setenv("EMAIL_PROVIDER", "smtp")
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("EMAIL_FROM_ADDRESS", "no-reply@example.com")
+    monkeypatch.setenv("FRONTEND_PUBLIC_BASE_URL", "https://app.example.com")
+
+
 def test_environment_production_rejects_kms_provider_local(monkeypatch) -> None:
     """PROJECT_PLAN.md's explicit requirement: production must never
     silently run with the development/test-only local KMS stand-in --
@@ -117,6 +127,7 @@ def test_environment_production_rejects_kms_provider_local(monkeypatch) -> None:
     """
     monkeypatch.setenv("ENVIRONMENT", "production")
     monkeypatch.setenv("KMS_PROVIDER", "local")
+    _set_valid_production_email_env(monkeypatch)
 
     with pytest.raises(ValidationError, match="not permitted when environment=production"):
         Settings()
@@ -145,8 +156,65 @@ def test_environment_production_accepts_kms_provider_azure(monkeypatch) -> None:
     monkeypatch.setenv("KMS_PROVIDER", "azure")
     monkeypatch.setenv("AZURE_KEY_VAULT_URL", "https://ekip-prod.vault.azure.net")
     monkeypatch.setenv("AZURE_KEY_VAULT_KEY_NAME", "connector-secrets-kek")
+    _set_valid_production_email_env(monkeypatch)
 
     settings = Settings()
 
     assert settings.environment == "production"
     assert settings.kms_provider == "azure"
+
+
+def _production_with_azure_kms(monkeypatch) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("KMS_PROVIDER", "azure")
+    monkeypatch.setenv("AZURE_KEY_VAULT_URL", "https://ekip-prod.vault.azure.net")
+    monkeypatch.setenv("AZURE_KEY_VAULT_KEY_NAME", "connector-secrets-kek")
+
+
+def test_production_refuses_to_boot_without_email_delivery(monkeypatch) -> None:
+    """Email verification is always enforced; production must never silently run
+    with no way to send the verification mail (which would lock signups out) --
+    it fails at process startup instead."""
+    _production_with_azure_kms(monkeypatch)
+    # Explicit values (not delenv): a developer's local .env must not be able to
+    # make this pass or fail.
+    monkeypatch.setenv("EMAIL_PROVIDER", "none")
+    monkeypatch.setenv("EMAIL_FROM_ADDRESS", "")
+    monkeypatch.setenv("SMTP_HOST", "")
+
+    with pytest.raises(ValidationError, match="requires working email delivery"):
+        Settings()
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({"EMAIL_PROVIDER": "none"}, "EMAIL_PROVIDER must not be 'none'"),
+        ({"EMAIL_FROM_ADDRESS": ""}, "EMAIL_FROM_ADDRESS is required"),
+        ({"SMTP_HOST": ""}, "SMTP_HOST is required"),
+        ({"SMTP_SECURITY": "none"}, "SMTP_SECURITY must be"),
+        ({"FRONTEND_PUBLIC_BASE_URL": "http://app.example.com"}, "must be an https:// URL"),
+    ],
+)
+def test_production_rejects_each_incomplete_email_setting(monkeypatch, override, expected) -> None:
+    _production_with_azure_kms(monkeypatch)
+    _set_valid_production_email_env(monkeypatch)
+    for key, value in override.items():
+        monkeypatch.setenv(key, value)
+
+    with pytest.raises(ValidationError, match=expected):
+        Settings()
+
+
+def test_development_boots_without_email_but_reports_it_unconfigured(monkeypatch) -> None:
+    from app.shared.email import email_delivery_configured
+    from app.shared.config import settings as settings_module
+
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("EMAIL_PROVIDER", "none")
+    settings_module.get_settings.cache_clear()
+    try:
+        assert Settings().email_provider == "none"
+        assert email_delivery_configured() is False
+    finally:
+        settings_module.get_settings.cache_clear()

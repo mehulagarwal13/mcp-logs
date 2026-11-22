@@ -496,19 +496,18 @@ async def reject_document(
 
 
 async def _purge_document_chunks(session: AsyncSession, document_id: uuid.UUID) -> list[str]:
-    """Delete every chunk row derived from `document_id`, across all three
-    collections, returning the collection names purged.
+    """Delete every chunk row derived from `document_id`, across ALL chunk
+    collections (documentation, code, conversations and incidents), returning
+    the collection names purged.
 
     Sweeps all collections rather than only `"documentation"` (the one
     `publish_document` writes): the same `documents` table is also populated
-    by `app.ingestion`, whose pipeline classifies content into `"code"` and
-    `"conversations"` too, so a document reaching this function could have
-    chunks in any of them. `retrieval.service.delete` is a no-op for a
-    collection with no matching rows, which is what makes sweeping all
-    three safe and idempotent rather than wasteful.
+    by `app.ingestion`, whose pipeline classifies content into `"code"`,
+    `"conversations"` and `"incidents"` too, so a document reaching this
+    function could have chunks in any of them. (This used to sweep only the
+    first three, silently leaving `incidents_chunks` behind.)
+    `retrieval.service.delete_document` is a no-op for a collection with no
+    matching rows, which is what makes sweeping all of them safe and
+    idempotent rather than wasteful.
     """
-    purged: list[str] = []
-    for collection in ("documentation", "code", "conversations"):
-        await retrieval_service.delete(session, collection, document_id)
-        purged.append(collection)
-    return purged
+    return list(await retrieval_service.delete_document(session, document_id))

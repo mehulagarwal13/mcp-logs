@@ -294,11 +294,13 @@ async def test_reject_document_soft_deletes(monkeypatch) -> None:
     # Rejection must also purge the derived chunks/embeddings, across every
     # collection -- a soft-deleted source row whose vectors survive would
     # stay quotable by the Answer Agent.
-    assert purged_collections == ["documentation", "code", "conversations"]
+    # All four chunk tables, `incidents` included (the sweep used to skip it).
+    assert purged_collections == ["documentation", "code", "conversations", "incidents"]
     assert audit_metadata["purged_chunk_collections"] == [
         "documentation",
         "code",
         "conversations",
+        "incidents",
     ]
 
 

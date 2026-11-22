@@ -14,10 +14,16 @@ that the *retain* decisions are as load-bearing as the delete ones.
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
 
 import pytest
 
-from app.core.exceptions import NotFoundError, PermissionDeniedError, ValidationError
+from app.core.exceptions import (
+    ConflictError,
+    NotFoundError,
+    PermissionDeniedError,
+    ValidationError,
+)
 from app.core.privacy import service as privacy_service
 from app.shared.schemas import ActorKind, Identity
 
@@ -55,12 +61,20 @@ def repo(monkeypatch):
             "project_memberships": 2,
             "external_identity_mappings": 1,
             "agent_executions": 40,
+            "mcp_requests": 6,
             "invitations": 1,
             "incidents_reported": 7,
             "user_private_memory": 4,
         },
         "calls": [],
         "revoked_sessions": 0,
+        # Membership / admin-guard / multi-org fakes (member-management audit V1+V2).
+        "is_member": True,
+        "last_admin": False,
+        "other_orgs": [],
+        "admin_checks": [],
+        "savepoints": 0,
+        "savepoint_rollbacks": 0,
     }
 
     async def _count(key):
@@ -69,6 +83,48 @@ def repo(monkeypatch):
     monkeypatch.setattr(
         privacy_service.repository, "user_exists",
         lambda s, u: _async(state["user_exists"]),
+    )
+    monkeypatch.setattr(
+        privacy_service.users_service, "is_organization_member",
+        lambda s, u, o: _async(state["is_member"]),
+    )
+
+    async def fake_assert_keeps_admin(session, organization_id, removing_user_id, *, lock):
+        state["admin_checks"].append((organization_id, removing_user_id, lock))  # type: ignore[union-attr]
+        if lock:
+            state["calls"].append("admin_lock")  # type: ignore[union-attr]
+        if state["last_admin"]:
+            raise ConflictError("last admin", error_code="org.last_admin")
+
+    monkeypatch.setattr(
+        privacy_service.users_service,
+        "assert_organization_keeps_an_admin",
+        fake_assert_keeps_admin,
+    )
+
+    @asynccontextmanager
+    async def fake_atomic(session):
+        """Stand-in for the SAVEPOINT: on an exception, forget the repository
+        calls made inside it (what ROLLBACK TO SAVEPOINT does to the data)."""
+        mark = len(state["calls"])  # type: ignore[arg-type]
+        state["savepoints"] += 1  # type: ignore[operator]
+        try:
+            yield
+        except BaseException:
+            del state["calls"][mark:]  # type: ignore[union-attr]
+            state["savepoint_rollbacks"] += 1  # type: ignore[operator]
+            raise
+
+    monkeypatch.setattr(privacy_service, "_atomic", fake_atomic)
+
+    async def fake_lock_user(session, user_id):
+        state["calls"].append("user_lock")  # type: ignore[union-attr]
+        return state["user_exists"]
+
+    monkeypatch.setattr(privacy_service.users_service, "lock_user_for_deletion", fake_lock_user)
+    monkeypatch.setattr(
+        privacy_service.users_service, "list_organizations_for_login",
+        lambda s, u: _async(list(state["other_orgs"])),
     )
     monkeypatch.setattr(
         privacy_service.repository, "is_user_anonymized",
@@ -97,6 +153,10 @@ def repo(monkeypatch):
     monkeypatch.setattr(
         privacy_service.repository, "count_agent_executions",
         lambda s, u, o: _count("agent_executions"),
+    )
+    monkeypatch.setattr(
+        privacy_service.repository, "count_mcp_requests",
+        lambda s, u, o: _count("mcp_requests"),
     )
     monkeypatch.setattr(
         privacy_service.repository, "count_invitations_for_email",
@@ -143,6 +203,9 @@ def repo(monkeypatch):
         privacy_service.repository,
         "anonymize_agent_executions",
         _mutation("anonymize_agent_executions", 40),
+    )
+    monkeypatch.setattr(
+        privacy_service.repository, "delete_mcp_requests", _mutation("delete_mcp_requests", 6)
     )
     monkeypatch.setattr(
         privacy_service.repository,
@@ -273,6 +336,7 @@ async def test_plan_classifies_access_artifacts_as_hard_delete(repo):
         "organization_roles",
         "project_memberships",
         "sso_identity_links",
+        "mcp_request_history",
         "user_private_memory",
     }
 
@@ -293,7 +357,7 @@ async def test_plan_counts_exclude_retained_rows_from_blast_radius(repo):
     plan = await privacy_service.plan_user_data_deletion(None, actor, uuid.uuid4())
     # 3 tokens + 1 role + 2 memberships + 1 mapping + 40 executions
     # + 4 private memories + 1 invite + 1 user
-    assert plan.total_rows_affected == 53
+    assert plan.total_rows_affected == 59
 
 
 @pytest.mark.asyncio
@@ -314,15 +378,19 @@ async def test_execute_completes_and_runs_every_mutation(repo):
 
     assert result.status == "completed"
     assert result.failed_steps == []
+    # Membership (`delete_user_roles`) is deliberately LAST.
     assert repo["calls"] == [
+        "admin_lock",
+        "user_lock",
         "delete_refresh_tokens",
-        "delete_user_roles",
         "delete_project_memberships",
         "delete_external_identity_mappings",
         "anonymize_agent_executions",
+        "delete_mcp_requests",
         "hard_delete_user_scoped_memory",
         "anonymize_invitations_for_email",
         "anonymize_user_record",
+        "delete_user_roles",
     ]
 
 
@@ -339,7 +407,7 @@ async def test_execute_revokes_sessions_through_the_existing_auth_service(repo):
 async def test_execute_reports_row_counts_split_by_action(repo):
     actor = _admin(uuid.uuid4())
     result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
-    assert result.hard_deleted_row_count == 3 + 1 + 2 + 1 + 4
+    assert result.hard_deleted_row_count == 3 + 1 + 2 + 1 + 6 + 4
     assert result.anonymized_row_count == 40 + 1 + 1
 
 
@@ -415,7 +483,7 @@ async def test_already_anonymized_user_skips_invitation_lookup_cleanly(repo):
     assert invitation_step.rows_affected == 0
     assert "anonymize_invitations_for_email" not in repo["calls"]
     # The step list still covers every category.
-    assert len(result.steps) == 8
+    assert len(result.steps) == 9
 
 
 # --- partial failure -------------------------------------------------------
@@ -432,9 +500,18 @@ async def test_one_failing_step_does_not_prevent_the_others(repo, monkeypatch):
     result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
 
     assert result.status == "partially_completed"
-    assert [s.category for s in result.failed_steps] == ["agent_execution_history"]
-    # The user record was still anonymized despite the earlier failure.
-    assert "anonymize_user_record" in repo["calls"]
+    # The failing step, plus the two steps deliberately held back because of it.
+    assert [s.category for s in result.failed_steps] == [
+        "agent_execution_history",
+        "user_record",
+        "organization_roles",
+    ]
+    # Independent cleanup steps still ran despite the failure ...
+    assert "hard_delete_user_scoped_memory" in repo["calls"]
+    assert "anonymize_invitations_for_email" in repo["calls"]
+    # ... but the global account and the membership were NOT touched.
+    assert "anonymize_user_record" not in repo["calls"]
+    assert "delete_user_roles" not in repo["calls"]
 
 
 @pytest.mark.asyncio
@@ -460,6 +537,7 @@ async def test_all_steps_failing_reports_failed_not_partial(repo, monkeypatch):
         "delete_project_memberships",
         "delete_external_identity_mappings",
         "anonymize_agent_executions",
+        "delete_mcp_requests",
         "anonymize_invitations_for_email",
         "anonymize_user_record",
     ):
@@ -476,7 +554,7 @@ async def test_all_steps_failing_reports_failed_not_partial(repo, monkeypatch):
     actor = _admin(uuid.uuid4())
     result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
     assert result.status == "failed"
-    assert len(result.failed_steps) == 8
+    assert len(result.failed_steps) == 9
 
 
 @pytest.mark.asyncio
@@ -502,7 +580,8 @@ async def test_audit_event_records_failed_step_names(repo, monkeypatch):
     await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
 
     event = repo["audit_events"][0]
-    assert event["metadata"]["failed_steps"] == ["organization_roles"]
+    # The final two steps are atomic, so both are reported when either fails.
+    assert event["metadata"]["failed_steps"] == ["user_record", "organization_roles"]
     assert event["metadata"]["status"] == "partially_completed"
 
 
@@ -529,3 +608,417 @@ async def test_retry_after_partial_failure_completes(repo, monkeypatch):
 
     second = await privacy_service.execute_user_data_deletion(None, actor, target)
     assert second.status == "completed"
+
+
+# --- V1: cross-tenant protection -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_on_a_non_member_is_refused_and_mutates_nothing(repo):
+    """V1: a user who is not a current member of the actor's organization must
+    never be touched -- above all the global `users` row."""
+    repo["is_member"] = False
+    actor = _admin(uuid.uuid4())
+    with pytest.raises(NotFoundError) as excinfo:
+        await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    assert excinfo.value.error_code == "privacy.user_not_found"
+    assert repo["calls"] == []
+    assert "anonymize_user_record" not in repo["calls"]
+    assert repo["revoked_sessions"] == 0
+    assert repo["audit_events"] == []
+
+
+@pytest.mark.asyncio
+async def test_plan_on_a_non_member_is_refused(repo):
+    repo["is_member"] = False
+    actor = _admin(uuid.uuid4())
+    with pytest.raises(NotFoundError):
+        await privacy_service.plan_user_data_deletion(None, actor, uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_non_member_and_nonexistent_user_are_indistinguishable(repo):
+    """No existence oracle across tenants: same error code, same message."""
+    actor = _admin(uuid.uuid4())
+    repo["user_exists"] = False
+    with pytest.raises(NotFoundError) as missing:
+        await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    repo["user_exists"] = True
+    repo["is_member"] = False
+    with pytest.raises(NotFoundError) as other_tenant:
+        await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    assert missing.value.error_code == other_tenant.value.error_code
+    assert missing.value.message == other_tenant.value.message
+
+
+@pytest.mark.asyncio
+async def test_repeating_a_completed_deletion_is_not_found_because_no_longer_a_member(repo):
+    """Documented consequence of requiring current membership."""
+    actor = _admin(uuid.uuid4())
+    target = uuid.uuid4()
+    await privacy_service.execute_user_data_deletion(None, actor, target)
+    repo["is_member"] = False  # their roles are gone now
+    repo["calls"].clear()
+    with pytest.raises(NotFoundError):
+        await privacy_service.execute_user_data_deletion(None, actor, target)
+    assert repo["calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_member_check_uses_the_actors_organization(repo, monkeypatch):
+    seen: list[tuple] = []
+
+    async def spy(session, user_id, organization_id):
+        seen.append((user_id, organization_id))
+        return True
+
+    monkeypatch.setattr(privacy_service.users_service, "is_organization_member", spy)
+    organization_id = uuid.uuid4()
+    target = uuid.uuid4()
+    await privacy_service.plan_user_data_deletion(None, _admin(organization_id), target)
+    assert seen == [(target, organization_id)]
+
+
+# --- V2: self-deletion and last admin --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_self_deletion_is_refused_even_when_another_admin_exists(repo):
+    actor = _admin(uuid.uuid4())
+    with pytest.raises(ValidationError) as excinfo:
+        await privacy_service.execute_user_data_deletion(None, actor, actor.user_id)
+    assert excinfo.value.error_code == "privacy.cannot_delete_self"
+    assert repo["calls"] == []
+    assert repo["admin_checks"] == []  # refused before any admin/lock logic
+    assert repo["audit_events"] == []
+
+
+@pytest.mark.asyncio
+async def test_self_plan_is_refused_too(repo):
+    actor = _admin(uuid.uuid4())
+    with pytest.raises(ValidationError):
+        await privacy_service.plan_user_data_deletion(None, actor, actor.user_id)
+
+
+@pytest.mark.asyncio
+async def test_last_admin_deletion_is_refused_and_mutates_nothing(repo):
+    repo["last_admin"] = True
+    actor = _admin(uuid.uuid4())
+    with pytest.raises(ConflictError) as excinfo:
+        await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    assert excinfo.value.error_code == "org.last_admin"
+    assert repo["calls"] == []
+    assert repo["revoked_sessions"] == 0
+    assert repo["audit_events"] == []
+
+
+@pytest.mark.asyncio
+async def test_dry_run_reports_the_last_admin_refusal_without_locking(repo):
+    repo["last_admin"] = True
+    actor = _admin(uuid.uuid4())
+    with pytest.raises(ConflictError):
+        await privacy_service.plan_user_data_deletion(None, actor, uuid.uuid4())
+    assert [lock for (_o, _u, lock) in repo["admin_checks"]] == [False]
+    assert "admin_lock" not in repo["calls"]
+
+
+@pytest.mark.asyncio
+async def test_execute_rechecks_last_admin_under_a_lock_before_any_mutation(repo):
+    actor = _admin(uuid.uuid4())
+    target = uuid.uuid4()
+    await privacy_service.execute_user_data_deletion(None, actor, target)
+    assert [lock for (_o, _u, lock) in repo["admin_checks"]] == [False, True]
+    assert repo["admin_checks"][1][:2] == (actor.organization_id, target)
+    assert repo["calls"][0] == "admin_lock"  # first thing that happens
+
+
+# --- Rule D: multi-organization users keep their global account ------------
+
+
+@pytest.mark.asyncio
+async def test_multi_org_user_keeps_global_account(repo):
+    repo["other_orgs"] = [uuid.uuid4()]
+    actor = _admin(uuid.uuid4())
+    result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+
+    assert "anonymize_user_record" not in repo["calls"]
+    # This organization's access and data are still removed.
+    for call in ("delete_user_roles", "delete_refresh_tokens", "delete_project_memberships"):
+        assert call in repo["calls"]
+    step = next(s for s in result.steps if s.category == "user_record")
+    assert step.action == "retain"
+    assert step.succeeded
+    assert step.rows_affected == 0
+    assert result.status == "completed"
+    assert repo["audit_events"][0]["metadata"]["account_retained_other_organizations"] is True
+
+
+@pytest.mark.asyncio
+async def test_multi_org_plan_marks_user_record_retain(repo):
+    repo["other_orgs"] = [uuid.uuid4()]
+    actor = _admin(uuid.uuid4())
+    plan = await privacy_service.plan_user_data_deletion(None, actor, uuid.uuid4())
+    step = next(s for s in plan.steps if s.category == "user_record")
+    assert step.action == "retain"
+    assert plan.total_rows_affected == 58  # 59 minus the retained users row
+
+
+@pytest.mark.asyncio
+async def test_single_org_user_is_still_fully_anonymized(repo):
+    actor = _admin(uuid.uuid4())
+    result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    assert "anonymize_user_record" in repo["calls"]
+    step = next(s for s in result.steps if s.category == "user_record")
+    assert step.action == "anonymize"
+    assert repo["audit_events"][0]["metadata"]["account_retained_other_organizations"] is False
+
+
+# --- Partial-deletion recovery: membership is removed LAST -----------------
+
+
+@pytest.mark.asyncio
+async def test_earlier_failure_keeps_membership_and_account(repo, monkeypatch):
+    """If any cleanup step fails, neither the membership nor the global
+    account may be touched -- the admin can retry the identical request."""
+    actor = _admin(uuid.uuid4())
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("simulated cleanup failure")
+
+    monkeypatch.setattr(privacy_service.repository, "delete_project_memberships", boom)
+    result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+
+    assert result.status == "partially_completed"
+    assert "delete_user_roles" not in repo["calls"]
+    assert "anonymize_user_record" not in repo["calls"]
+    blocked = {s.category: s for s in result.steps if not s.succeeded}
+    assert set(blocked) == {"project_memberships", "user_record", "organization_roles"}
+    assert "retried" in blocked["organization_roles"].error
+
+
+@pytest.mark.asyncio
+async def test_retry_after_a_blocked_run_completes_while_still_a_member(repo, monkeypatch):
+    """The scenario that motivated the reordering: because membership was kept,
+    the second request passes the current-membership check and finishes."""
+    actor = _admin(uuid.uuid4())
+    target = uuid.uuid4()
+    state = {"fail": True}
+    real = privacy_service.repository.delete_project_memberships
+
+    async def flaky(*args, **kwargs):
+        if state["fail"]:
+            raise RuntimeError("transient")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(privacy_service.repository, "delete_project_memberships", flaky)
+    first = await privacy_service.execute_user_data_deletion(None, actor, target)
+    assert first.status == "partially_completed"
+    assert repo["is_member"] is True  # membership untouched, so a retry is allowed
+
+    state["fail"] = False
+    second = await privacy_service.execute_user_data_deletion(None, actor, target)
+    assert second.status == "completed"
+    assert repo["calls"][-1] == "delete_user_roles"
+    assert "anonymize_user_record" in repo["calls"]
+
+
+@pytest.mark.asyncio
+async def test_failed_account_step_also_keeps_membership(repo, monkeypatch):
+    actor = _admin(uuid.uuid4())
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("anonymize failed")
+
+    monkeypatch.setattr(privacy_service.repository, "anonymize_user_record", boom)
+    result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    assert result.status == "partially_completed"
+    assert "delete_user_roles" not in repo["calls"]
+    assert next(s for s in result.steps if s.category == "organization_roles").succeeded is False
+
+
+@pytest.mark.asyncio
+async def test_failure_of_the_role_deletion_itself_is_reported_and_retryable(repo, monkeypatch):
+    actor = _admin(uuid.uuid4())
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("role delete failed")
+
+    monkeypatch.setattr(privacy_service.repository, "delete_user_roles", boom)
+    result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    assert result.status == "partially_completed"
+    assert repo["is_member"] is True  # nothing changed membership, retry stays possible
+
+
+# --- Locks, and decisions made under them ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_both_locks_are_taken_before_any_mutation_in_order(repo):
+    actor = _admin(uuid.uuid4())
+    await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    assert repo["calls"][:2] == ["admin_lock", "user_lock"]
+
+
+@pytest.mark.asyncio
+async def test_membership_is_rechecked_after_the_locks(repo, monkeypatch):
+    """The plan's membership check runs before the locks; if the person was
+    removed in between, execution must refuse and mutate nothing."""
+    actor = _admin(uuid.uuid4())
+    answers = iter([True, False])  # plan: member; after locks: no longer a member
+
+    async def flip(session, user_id, organization_id):
+        return next(answers)
+
+    monkeypatch.setattr(privacy_service.users_service, "is_organization_member", flip)
+    with pytest.raises(NotFoundError):
+        await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    assert "delete_refresh_tokens" not in repo["calls"]
+    assert "anonymize_user_record" not in repo["calls"]
+    assert repo["audit_events"] == []
+
+
+@pytest.mark.asyncio
+async def test_anonymization_decision_uses_state_read_after_the_locks(repo, monkeypatch):
+    """Plan saw no other organization; by execution time another membership
+    exists (e.g. granted elsewhere). The account must be retained."""
+    actor = _admin(uuid.uuid4())
+    answers = iter([[], [uuid.uuid4()]])  # plan: none; execution: one other org
+
+    async def changing(session, user_id):
+        return next(answers)
+
+    monkeypatch.setattr(privacy_service.users_service, "list_organizations_for_login", changing)
+    result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    assert "anonymize_user_record" not in repo["calls"]
+    assert next(s for s in result.steps if s.category == "user_record").action == "retain"
+    assert "delete_user_roles" in repo["calls"]
+
+
+# --- Final two steps are atomic (SAVEPOINT) ------------------------------------
+
+
+def _db_error() -> Exception:
+    from sqlalchemy.exc import DBAPIError
+
+    return DBAPIError("DELETE FROM user_roles ...", {}, Exception("simulated database error"))
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("simulated non-database failure"), _db_error()],
+    ids=["python-error", "database-error"],
+)
+@pytest.mark.asyncio
+async def test_final_role_deletion_failure_rolls_back_the_account_anonymization(
+    repo, monkeypatch, failure
+):
+    """Single-org target; everything earlier succeeds; the LAST step fails.
+    The anonymization (done a moment earlier) must be undone with it."""
+    actor = _admin(uuid.uuid4())
+
+    async def boom(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(privacy_service.repository, "delete_user_roles", boom)
+    result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+
+    assert result.status == "partially_completed"
+    # Atomic: the anonymization was rolled back together with the failed deletion.
+    assert "anonymize_user_record" not in repo["calls"]
+    assert "delete_user_roles" not in repo["calls"]
+    assert repo["savepoint_rollbacks"] == 1
+    # Earlier cleanup stays applied.
+    for kept in (
+        "delete_refresh_tokens",
+        "delete_project_memberships",
+        "anonymize_agent_executions",
+    ):
+        assert kept in repo["calls"]
+    steps = {s.category: s for s in result.steps}
+    assert steps["organization_roles"].succeeded is False
+    assert steps["user_record"].succeeded is False
+    assert "Rolled back together with organization_roles" in steps["user_record"].error
+    assert "retried" in steps["user_record"].error
+    # The failure is audited, and the person is still a member (retryable).
+    event = repo["audit_events"][0]
+    assert event["metadata"]["status"] == "partially_completed"
+    assert set(event["metadata"]["failed_steps"]) == {"user_record", "organization_roles"}
+    assert event["metadata"]["account_retained_other_organizations"] is False
+    assert repo["is_member"] is True
+
+
+@pytest.mark.asyncio
+async def test_retry_after_a_rolled_back_final_step_completes(repo, monkeypatch):
+    actor = _admin(uuid.uuid4())
+    target = uuid.uuid4()
+    real = privacy_service.repository.delete_user_roles
+    state = {"fail": True}
+
+    async def flaky(*args, **kwargs):
+        if state["fail"]:
+            raise RuntimeError("transient")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(privacy_service.repository, "delete_user_roles", flaky)
+    first = await privacy_service.execute_user_data_deletion(None, actor, target)
+    assert first.status == "partially_completed"
+    assert "anonymize_user_record" not in repo["calls"]
+
+    state["fail"] = False
+    second = await privacy_service.execute_user_data_deletion(None, actor, target)
+    assert second.status == "completed"
+    assert repo["calls"][-2:] == ["anonymize_user_record", "delete_user_roles"]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_anonymization_means_the_role_deletion_is_never_attempted(
+    repo, monkeypatch
+):
+    actor = _admin(uuid.uuid4())
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("anonymize failed")
+
+    monkeypatch.setattr(privacy_service.repository, "anonymize_user_record", boom)
+    result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    assert result.status == "partially_completed"
+    assert "delete_user_roles" not in repo["calls"]
+    steps = {s.category: s for s in result.steps}
+    assert "anonymize failed" in steps["user_record"].error
+    assert "Rolled back together with user_record" in steps["organization_roles"].error
+
+
+@pytest.mark.asyncio
+async def test_multi_org_final_role_deletion_failure_is_also_rolled_back(repo, monkeypatch):
+    repo["other_orgs"] = [uuid.uuid4()]
+    actor = _admin(uuid.uuid4())
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("role delete failed")
+
+    monkeypatch.setattr(privacy_service.repository, "delete_user_roles", boom)
+    result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    assert result.status == "partially_completed"
+    assert "anonymize_user_record" not in repo["calls"]
+    # No "retained" claim is made for a decision that was rolled back.
+    assert repo["audit_events"][0]["metadata"]["account_retained_other_organizations"] is False
+    assert all(s.action != "retain" for s in result.steps if s.category == "user_record")
+
+
+@pytest.mark.asyncio
+async def test_successful_run_uses_exactly_one_savepoint_and_never_rolls_it_back(repo):
+    actor = _admin(uuid.uuid4())
+    result = await privacy_service.execute_user_data_deletion(None, actor, uuid.uuid4())
+    assert result.status == "completed"
+    assert repo["savepoints"] == 1
+    assert repo["savepoint_rollbacks"] == 0
+
+
+@pytest.mark.asyncio
+async def test_no_savepoint_when_an_earlier_step_already_failed(repo, monkeypatch):
+    async def boom(*args, **kwargs):
+        raise RuntimeError("earlier failure")
+
+    monkeypatch.setattr(privacy_service.repository, "delete_project_memberships", boom)
+    await privacy_service.execute_user_data_deletion(None, _admin(uuid.uuid4()), uuid.uuid4())
+    assert repo["savepoints"] == 0  # the final pair is held back entirely

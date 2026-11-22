@@ -6,8 +6,9 @@
     (see `ingestion.connectors.github`'s module docstring for the `"kind"`
     metadata key convention this relies on).
   - `_should_augment_with_live_evidence`'s hybrid trigger logic and
-    `_gather_live_evidence`'s dispatch-by-connector-source behavior -- the
-    live-evidence extension (`agents.investigation.live/`).
+    `_gather_live_evidence`'s authorization, credential handling, dispatch
+    and status reporting -- the live-evidence extension
+    (`agents.investigation.live/`).
   - `_gather_postmortem_evidence`'s P4 deduplication against runbook
     evidence, and `_is_duplicate_of_runbook_evidence`'s correlation-key/
     content-identity-fallback logic it relies on.
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,11 +33,17 @@ from app.agents.investigation.evidence import (
     _parse_source_timestamp,
     _should_augment_with_live_evidence,
 )
+from app.agents.investigation.live.base import LiveSourceAuthError
 from app.agents.investigation.live.monitoring_live import MonitoringLiveSource
+from app.core.exceptions import NotFoundError, PermissionDeniedError
 from app.core.incidents.schemas import Postmortem
-from app.core.tenancy.schemas import ConnectorConfig
+from app.core.tenancy.live_credentials import (
+    LiveConnectorCredential,
+    LiveConnectorResolution,
+    LiveConnectorSkip,
+)
 from app.retrieval.schemas import ScoredChunk, SearchFilters
-from app.shared.schemas import EvidenceItem, Identity
+from app.shared.schemas import ActorKind, EvidenceItem, Identity
 
 
 def _chunk(metadata: dict[str, str], content: str = "some content") -> ScoredChunk:
@@ -562,153 +570,77 @@ def test_should_not_augment_when_plenty_of_fresh_evidence_and_no_incident() -> N
     assert _should_augment_with_live_evidence(evidence, None) is False
 
 
-# --- _gather_live_evidence ---------------------------------------------------
+# --- live evidence: authorization, credentials, status ----------------------
+#
+# `_gather_live_evidence` / `gather_evidence_with_status`. The incident read
+# and the connector resolver are faked at the `evidence_module` boundary, plus
+# a few tests that run the REAL `core.tenancy` resolver over fake rows to
+# prove a non-admin investigator's real (decrypted) token reaches the source.
+
+_REAL_TOKEN = "ghp_REAL_decrypted_token_SECRET"
 
 
-def _connector_config(source: str, status: str = "active") -> ConnectorConfig:
-    now = datetime.now(timezone.utc)
-    return ConnectorConfig(
-        id=uuid.uuid4(),
-        organization_id=uuid.uuid4(),
-        project_id=None,
+def _credential(source: str, token: str = _REAL_TOKEN, organization_id=None, project_id=None):
+    return LiveConnectorCredential(
+        connector_config_id=uuid.uuid4(),
+        organization_id=organization_id or uuid.uuid4(),
+        project_id=project_id,
         source=source,
-        credential_ref="token-ref",
         config={},
-        status=status,
-        last_synced_at=None,
-        created_at=now,
-        updated_at=now,
+        token=token,
+    )
+
+
+def _item(source: str, reference: str) -> EvidenceItem:
+    return EvidenceItem(
+        source=source, reference=reference, summary="s", retrieved_at=datetime.now(timezone.utc)
     )
 
 
 class _FakeLiveSource:
-    def __init__(self, items: list[EvidenceItem]) -> None:
-        self._items = items
+    def __init__(self, items: list[EvidenceItem] | None = None, error: Exception | None = None):
+        self._items = items or []
+        self._error = error
         self.calls = 0
+        self.tokens_seen: list[str] = []
 
-    async def fetch_live_evidence(self, *, connector_config, query, since, limit):
+    async def fetch_live_evidence(self, *, connector, query, since, limit):
         self.calls += 1
+        self.tokens_seen.append(connector.reveal_token())
+        if self._error is not None:
+            raise self._error
         return self._items
 
 
-def test_monitoring_connector_source_resolves_to_monitoring_live_source() -> None:
-    """`ConnectorSource.MONITORING`'s whole point: a `connector_config` with
-    `source="monitoring"` must actually dispatch to `MonitoringLiveSource`,
-    not be silently skipped the way an unregistered source (e.g. `"jira"`)
-    already is (`test_gather_live_evidence_dispatches_by_connector_source`
-    covers that skip behavior). Uses the real, module-level `_LIVE_SOURCES`
-    (not a monkeypatched fake, unlike the dispatch tests below) so this test
-    fails if the registration itself is ever accidentally removed.
-    """
-    assert "monitoring" in _LIVE_SOURCES
-    assert isinstance(_LIVE_SOURCES["monitoring"], MonitoringLiveSource)
+def _incident(organization_id: uuid.UUID, project_id: uuid.UUID | None = None):
+    return SimpleNamespace(organization_id=organization_id, project_id=project_id or uuid.uuid4())
 
 
-@pytest.mark.asyncio
-async def test_gather_live_evidence_dispatches_monitoring_connector(monkeypatch) -> None:
-    """End-to-end confirmation that a `source="monitoring"` connector config
-    is no longer silently skipped: `_gather_live_evidence` now looks it up in
-    `_LIVE_SOURCES` and calls its `fetch_live_evidence`, exactly like
-    `"github"`/`"slack"` already do.
-    """
-    monitoring_config = _connector_config("monitoring")
+def _stub_incident(monkeypatch, incident=None, error: Exception | None = None) -> None:
+    async def fake_get_incident(session, actor, organization_id, incident_id):
+        if error is not None:
+            raise error
+        return incident or _incident(organization_id)
 
-    async def fake_list_connectors(session, actor, organization_id):
-        return [monitoring_config]
-
-    monkeypatch.setattr(evidence_module.tenancy_service, "list_connectors", fake_list_connectors)
-
-    monitoring_item = EvidenceItem(
-        source="monitoring", reference="r3", summary="s3", retrieved_at=datetime.now(timezone.utc)
-    )
-    fake_monitoring = _FakeLiveSource([monitoring_item])
-    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"monitoring": fake_monitoring})
-
-    actor = Identity.for_agent("test_agent", uuid.uuid4())
-    result = await _gather_live_evidence(
-        session=None, query="disk usage spike", actor=actor, retry_count={}
-    )
-
-    assert result == [monitoring_item]
-    assert fake_monitoring.calls == 1
+    monkeypatch.setattr(evidence_module.incidents_service, "get_incident", fake_get_incident)
 
 
-@pytest.mark.asyncio
-async def test_gather_live_evidence_dispatches_by_connector_source(monkeypatch) -> None:
-    """One live source per connector `source`; a connector whose source has
-    no registered `LiveEvidenceSource` (here, `"jira"`) is silently skipped
-    -- mirroring this module's existing, honestly-empty `_gather_jira_evidence`.
-    """
-    github_config = _connector_config("github")
-    slack_config = _connector_config("slack")
-    jira_config = _connector_config("jira")
+def _stub_resolver(monkeypatch, credentials=(), skipped=(), error: Exception | None = None):
+    calls = {"count": 0}
 
-    async def fake_list_connectors(session, actor, organization_id):
-        return [github_config, slack_config, jira_config]
+    async def fake_resolve(session, actor, organization_id, **kwargs):
+        calls["count"] += 1
+        if error is not None:
+            raise error
+        return LiveConnectorResolution(credentials=list(credentials), skipped=list(skipped))
 
-    monkeypatch.setattr(evidence_module.tenancy_service, "list_connectors", fake_list_connectors)
-
-    github_item = EvidenceItem(
-        source="commit", reference="r1", summary="s1", retrieved_at=datetime.now(timezone.utc)
-    )
-    slack_item = EvidenceItem(
-        source="slack", reference="r2", summary="s2", retrieved_at=datetime.now(timezone.utc)
-    )
-    fake_github = _FakeLiveSource([github_item])
-    fake_slack = _FakeLiveSource([slack_item])
     monkeypatch.setattr(
-        evidence_module, "_LIVE_SOURCES", {"github": fake_github, "slack": fake_slack}
+        evidence_module.tenancy_service, "resolve_live_evidence_connectors", fake_resolve
     )
-
-    actor = Identity.for_agent("test_agent", uuid.uuid4())
-    result = await _gather_live_evidence(
-        session=None, query="checkout failing", actor=actor, retry_count={}
-    )
-
-    assert result == [github_item, slack_item]
-    assert fake_github.calls == 1
-    assert fake_slack.calls == 1
+    return calls
 
 
-@pytest.mark.asyncio
-async def test_gather_live_evidence_skips_inactive_connectors(monkeypatch) -> None:
-    inactive_config = _connector_config("github", status="error")
-
-    async def fake_list_connectors(session, actor, organization_id):
-        return [inactive_config]
-
-    monkeypatch.setattr(evidence_module.tenancy_service, "list_connectors", fake_list_connectors)
-    fake_github = _FakeLiveSource(
-        [EvidenceItem(source="commit", reference="r", summary="s", retrieved_at=datetime.now(timezone.utc))]
-    )
-    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"github": fake_github})
-
-    actor = Identity.for_agent("test_agent", uuid.uuid4())
-    result = await _gather_live_evidence(session=None, query="q", actor=actor, retry_count={})
-
-    assert result == []
-    assert fake_github.calls == 0
-
-
-@pytest.mark.asyncio
-async def test_gather_live_evidence_returns_empty_when_list_connectors_fails(monkeypatch) -> None:
-    async def failing_list_connectors(session, actor, organization_id):
-        raise RuntimeError("db unavailable")
-
-    monkeypatch.setattr(evidence_module.tenancy_service, "list_connectors", failing_list_connectors)
-
-    actor = Identity.for_agent("test_agent", uuid.uuid4())
-    result = await _gather_live_evidence(session=None, query="q", actor=actor, retry_count={})
-
-    assert result == []
-
-
-@pytest.mark.asyncio
-async def test_gather_live_evidence_logs_and_skips_source_that_raises(monkeypatch) -> None:
-    """One connector's live lookup failing (bad token, rate limit, timeout)
-    must not affect any other connector's -- same non-fatal discipline as
-    every other source in this module.
-    """
+def _no_sleep(monkeypatch) -> None:
     import app.agents.retry as retry_module
 
     async def instant_sleep(_seconds: float) -> None:
@@ -716,20 +648,483 @@ async def test_gather_live_evidence_logs_and_skips_source_that_raises(monkeypatc
 
     monkeypatch.setattr(retry_module.asyncio, "sleep", instant_sleep)
 
-    github_config = _connector_config("github")
 
-    async def fake_list_connectors(session, actor, organization_id):
-        return [github_config]
+def _actor() -> Identity:
+    return Identity.for_agent("test_agent", uuid.uuid4())
 
-    monkeypatch.setattr(evidence_module.tenancy_service, "list_connectors", fake_list_connectors)
 
-    class _FailingLiveSource:
-        async def fetch_live_evidence(self, **kwargs):
-            raise RuntimeError("github search failed")
+async def _live(monkeypatch, actor=None):
+    actor = actor or _actor()
+    return await _gather_live_evidence(
+        session=None, query="checkout failing", actor=actor, retry_count={}, incident_id=uuid.uuid4()
+    )
 
-    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"github": _FailingLiveSource()})
 
-    actor = Identity.for_agent("test_agent", uuid.uuid4())
-    result = await _gather_live_evidence(session=None, query="q", actor=actor, retry_count={})
+def test_monitoring_connector_source_resolves_to_monitoring_live_source() -> None:
+    """A `source="monitoring"` connector must dispatch to `MonitoringLiveSource`
+    (real, un-monkeypatched `_LIVE_SOURCES`, so this fails if the registration
+    is ever removed).
+    """
+    assert "monitoring" in _LIVE_SOURCES
+    assert isinstance(_LIVE_SOURCES["monitoring"], MonitoringLiveSource)
 
-    assert result == []
+
+@pytest.mark.asyncio
+async def test_live_evidence_dispatches_by_connector_source_and_reports_ok(monkeypatch) -> None:
+    github_item, slack_item = _item("commit", "r1"), _item("slack", "r2")
+    fake_github, fake_slack = _FakeLiveSource([github_item]), _FakeLiveSource([slack_item])
+    monkeypatch.setattr(
+        evidence_module, "_LIVE_SOURCES", {"github": fake_github, "slack": fake_slack}
+    )
+    _stub_incident(monkeypatch)
+    _stub_resolver(monkeypatch, credentials=[_credential("github"), _credential("slack")])
+
+    items, status = await _live(monkeypatch)
+
+    assert items == [github_item, slack_item]
+    assert status.status == "ok"
+    assert [(o.source, o.outcome, o.items_returned) for o in status.sources] == [
+        ("github", "ok", 1),
+        ("slack", "ok", 1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_live_evidence_dispatches_monitoring_connector(monkeypatch) -> None:
+    monitoring_item = _item("monitoring", "r3")
+    fake_monitoring = _FakeLiveSource([monitoring_item])
+    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"monitoring": fake_monitoring})
+    _stub_incident(monkeypatch)
+    _stub_resolver(monkeypatch, credentials=[_credential("monitoring")])
+
+    items, status = await _live(monkeypatch)
+
+    assert items == [monitoring_item]
+    assert fake_monitoring.calls == 1
+    assert status.status == "ok"
+
+
+# -- the original bugs: non-admin investigator + real (not redacted) token --
+
+
+@pytest.mark.asyncio
+async def test_non_admin_investigator_gets_live_evidence_with_the_real_token(monkeypatch) -> None:
+    """End to end through the REAL `core.tenancy` resolver: an actor with only
+    `incident:read` (no `tenancy:manage`) gets live evidence, and the source
+    receives the decrypted token -- not the redaction placeholder.
+    """
+    from app.core.tenancy import service as real_tenancy
+    from app.shared.security import encrypt_secret, get_kms
+
+    organization_id, project_id = uuid.uuid4(), uuid.uuid4()
+    investigator = Identity(
+        kind=ActorKind.USER,
+        subject=str(uuid.uuid4()),
+        organization_id=organization_id,
+        user_id=uuid.uuid4(),
+        permissions=frozenset({"incident:read"}),
+    )
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        organization_id=organization_id,
+        project_id=None,
+        source="github",
+        status="active",
+        credential_ref=await encrypt_secret(get_kms(), _REAL_TOKEN),
+        config={"repos": [{"repo": "acme/widgets"}]},
+    )
+
+    async def fake_rows(session, org_id):
+        return [row]
+
+    monkeypatch.setattr(real_tenancy.repository, "list_connector_configs", fake_rows)
+    fake_github = _FakeLiveSource([_item("commit", "r1")])
+    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"github": fake_github})
+    _stub_incident(monkeypatch, incident=_incident(organization_id, project_id))
+
+    items, status = await _live(monkeypatch, actor=investigator)
+
+    assert status.status == "ok"
+    assert len(items) == 1
+    assert fake_github.tokens_seen == [_REAL_TOKEN]
+    assert fake_github.tokens_seen[0] != real_tenancy._REDACTED_CREDENTIAL
+
+
+@pytest.mark.asyncio
+async def test_actor_without_incident_read_gets_no_live_evidence_and_no_token_access(
+    monkeypatch,
+) -> None:
+    """Real resolver, real permission check: no `incident:read` -> the
+    resolver refuses before reading connectors; status says why.
+    """
+    organization_id = uuid.uuid4()
+    nobody = Identity(
+        kind=ActorKind.USER,
+        subject=str(uuid.uuid4()),
+        organization_id=organization_id,
+        user_id=uuid.uuid4(),
+        permissions=frozenset({"tenancy:manage"}),  # admin-ish, but cannot read incidents
+    )
+    fake_github = _FakeLiveSource([_item("commit", "r1")])
+    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"github": fake_github})
+    _stub_incident(monkeypatch)  # the incident lookup itself succeeds in this fake
+
+    items, status = await _live(monkeypatch, actor=nobody)
+
+    assert items == []
+    assert (status.status, status.reason) == ("unavailable", "not_authorized")
+    assert fake_github.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_incident_the_actor_cannot_read_yields_unavailable_and_touches_no_connectors(
+    monkeypatch,
+) -> None:
+    fake_github = _FakeLiveSource([_item("commit", "r1")])
+    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"github": fake_github})
+    _stub_incident(monkeypatch, error=PermissionDeniedError("no"))
+    resolver_calls = _stub_resolver(monkeypatch, credentials=[_credential("github")])
+
+    items, status = await _live(monkeypatch)
+
+    assert items == []
+    assert (status.status, status.reason) == ("unavailable", "incident_not_authorized")
+    assert resolver_calls["count"] == 0
+    assert fake_github.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_unknown_or_cross_tenant_incident_looks_the_same_as_unauthorized(monkeypatch) -> None:
+    _stub_incident(monkeypatch, error=NotFoundError("missing"))
+    resolver_calls = _stub_resolver(monkeypatch, credentials=[_credential("github")])
+
+    items, status = await _live(monkeypatch)
+
+    assert items == []
+    assert (status.status, status.reason) == ("unavailable", "incident_not_authorized")
+    assert resolver_calls["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_incident_from_another_organization_is_refused_by_the_real_resolver(
+    monkeypatch,
+) -> None:
+    my_org, other_org = uuid.uuid4(), uuid.uuid4()
+    actor = Identity(
+        kind=ActorKind.USER,
+        subject=str(uuid.uuid4()),
+        organization_id=my_org,
+        user_id=uuid.uuid4(),
+        permissions=frozenset({"incident:read"}),
+    )
+    fake_github = _FakeLiveSource([_item("commit", "r1")])
+    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"github": fake_github})
+    _stub_incident(monkeypatch, incident=_incident(other_org))  # forged: wrong org
+
+    items, status = await _live(monkeypatch, actor=actor)
+
+    assert items == []
+    assert (status.status, status.reason) == ("unavailable", "not_authorized")
+    assert fake_github.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_resolver_permission_error_is_reported_not_swallowed(monkeypatch) -> None:
+    _stub_incident(monkeypatch)
+    _stub_resolver(monkeypatch, error=PermissionDeniedError("no"))
+
+    items, status = await _live(monkeypatch)
+
+    assert items == []
+    assert (status.status, status.reason) == ("unavailable", "not_authorized")
+
+
+@pytest.mark.asyncio
+async def test_unexpected_resolver_failure_is_reported_as_unavailable(monkeypatch) -> None:
+    _stub_incident(monkeypatch)
+    _stub_resolver(monkeypatch, error=RuntimeError("db unavailable"))
+
+    items, status = await _live(monkeypatch)
+
+    assert items == []
+    assert (status.status, status.reason) == ("unavailable", "connector_lookup_failed")
+    assert "db unavailable" not in status.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_no_live_connectors_is_reported(monkeypatch) -> None:
+    _stub_incident(monkeypatch)
+    _stub_resolver(monkeypatch)
+
+    items, status = await _live(monkeypatch)
+
+    assert items == []
+    assert (status.status, status.reason) == ("unavailable", "no_live_connectors")
+
+
+# -- invalid credentials and failures are visible --
+
+
+@pytest.mark.asyncio
+async def test_invalid_credential_is_reported_not_retried_and_isolated(monkeypatch) -> None:
+    slack_item = _item("slack", "r2")
+    rejected = _FakeLiveSource(error=LiveSourceAuthError("rejected"))
+    healthy = _FakeLiveSource([slack_item])
+    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"github": rejected, "slack": healthy})
+    _stub_incident(monkeypatch)
+    _stub_resolver(monkeypatch, credentials=[_credential("github"), _credential("slack")])
+
+    items, status = await _live(monkeypatch)
+
+    assert items == [slack_item]  # one connector's bad token does not affect another
+    assert status.status == "partial"
+    assert [(o.source, o.outcome) for o in status.sources] == [
+        ("github", "auth_failed"),
+        ("slack", "ok"),
+    ]
+    assert rejected.calls == 1  # an auth failure is not retried
+
+
+@pytest.mark.asyncio
+async def test_all_sources_failing_is_reported_as_failed_without_leaking_details(
+    monkeypatch,
+) -> None:
+    _no_sleep(monkeypatch)
+    failing = _FakeLiveSource(error=RuntimeError("github search failed: token=" + _REAL_TOKEN))
+    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"github": failing})
+    _stub_incident(monkeypatch)
+    _stub_resolver(monkeypatch, credentials=[_credential("github")])
+
+    items, status = await _live(monkeypatch)
+
+    assert items == []
+    assert status.status == "failed"
+    assert [(o.outcome, o.reason) for o in status.sources] == [("error", "lookup_failed")]
+    dumped = status.model_dump_json()
+    assert _REAL_TOKEN not in dumped and "github search failed" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_credential_that_could_not_be_decrypted_is_reported_as_skipped(monkeypatch) -> None:
+    healthy = _FakeLiveSource([_item("slack", "r2")])
+    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"github": healthy, "slack": healthy})
+    _stub_incident(monkeypatch)
+    skipped = LiveConnectorSkip(
+        connector_config_id=uuid.uuid4(), source="github", reason="credential_unavailable"
+    )
+    _stub_resolver(monkeypatch, credentials=[_credential("slack")], skipped=[skipped])
+
+    _items, status = await _live(monkeypatch)
+
+    assert status.status == "partial"
+    assert {(o.source, o.outcome, o.reason) for o in status.sources} == {
+        ("github", "skipped", "credential_unavailable"),
+        ("slack", "ok", None),
+    }
+
+
+# -- when live evidence is (not) attempted, via the public entry point --
+
+
+async def _gather_with_status(monkeypatch, *, incident_id, indexed=()):
+    from app.agents.investigation.evidence import gather_evidence_with_status
+
+    async def fake_code(session, query, filters, retry_count):
+        return list(indexed)
+
+    async def nothing(session, query, filters, retry_count):
+        return []
+
+    async def no_postmortems(session, actor, retry_count, existing_evidence):
+        return []
+
+    monkeypatch.setattr(evidence_module, "_gather_code_evidence", fake_code)
+    monkeypatch.setattr(evidence_module, "_gather_knowledge_evidence", nothing)
+    monkeypatch.setattr(evidence_module, "_gather_slack_evidence", nothing)
+    monkeypatch.setattr(evidence_module, "_gather_postmortem_evidence", no_postmortems)
+    monkeypatch.setattr(evidence_module, "_gather_jira_evidence", lambda: [])
+    monkeypatch.setattr(evidence_module, "_gather_monitoring_evidence", lambda: [])
+    return await gather_evidence_with_status(
+        session=None, query="q", actor=_actor(), retry_count={}, incident_id=incident_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_question_without_an_incident_never_triggers_live_lookups(monkeypatch) -> None:
+    """`POST /ask` with no `incident_id`: thin indexed evidence would normally
+    trigger live augmentation, but an org-wide token must not be used for it.
+    """
+    monkeypatch.setattr(evidence_module.get_settings(), "investigation_live_evidence_enabled", True)
+    fake_github = _FakeLiveSource([_item("commit", "r1")])
+    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"github": fake_github})
+    _stub_incident(monkeypatch)
+    resolver_calls = _stub_resolver(monkeypatch, credentials=[_credential("github")])
+
+    items, status = await _gather_with_status(monkeypatch, incident_id=None)
+
+    assert items == []
+    assert (status.status, status.reason) == ("not_attempted", "no_incident_context")
+    assert resolver_calls["count"] == 0
+    assert fake_github.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_reports_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(evidence_module.get_settings(), "investigation_live_evidence_enabled", False)
+    resolver_calls = _stub_resolver(monkeypatch, credentials=[_credential("github")])
+
+    _items, status = await _gather_with_status(monkeypatch, incident_id=uuid.uuid4())
+
+    assert (status.status, status.reason) == ("not_attempted", "disabled")
+    assert resolver_calls["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_full_indexed_evidence_skips_live_lookup(monkeypatch) -> None:
+    monkeypatch.setattr(evidence_module.get_settings(), "investigation_live_evidence_enabled", True)
+    resolver_calls = _stub_resolver(monkeypatch, credentials=[_credential("github")])
+    full = [_item("commit", f"r{i}") for i in range(evidence_module._EVIDENCE_CAP)]
+
+    items, status = await _gather_with_status(monkeypatch, incident_id=uuid.uuid4(), indexed=full)
+
+    assert len(items) == evidence_module._EVIDENCE_CAP
+    assert (status.status, status.reason) == ("not_attempted", "indexed_evidence_sufficient")
+    assert resolver_calls["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_authorized_incident_investigation_appends_live_evidence(monkeypatch) -> None:
+    monkeypatch.setattr(evidence_module.get_settings(), "investigation_live_evidence_enabled", True)
+    live_item = _item("commit", "live-1")
+    monkeypatch.setattr(evidence_module, "_LIVE_SOURCES", {"github": _FakeLiveSource([live_item])})
+    _stub_incident(monkeypatch)
+    _stub_resolver(monkeypatch, credentials=[_credential("github")])
+
+    items, status = await _gather_with_status(monkeypatch, incident_id=uuid.uuid4())
+
+    assert items == [live_item]
+    assert status.status == "ok"
+
+
+# -- the monitoring stub must never be reported as a successful source --
+
+
+def test_monitoring_source_is_flagged_as_not_implemented() -> None:
+    assert _LIVE_SOURCES["monitoring"].implemented is False
+    assert getattr(_LIVE_SOURCES["github"], "implemented", True) is True
+
+
+def _investigator(organization_id: uuid.UUID) -> Identity:
+    return Identity(
+        kind=ActorKind.USER,
+        subject=str(uuid.uuid4()),
+        organization_id=organization_id,
+        user_id=uuid.uuid4(),
+        permissions=frozenset({"incident:read"}),
+    )
+
+
+def _row(organization_id: uuid.UUID, source: str, credential_ref: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        organization_id=organization_id,
+        project_id=None,
+        source=source,
+        status="active",
+        credential_ref=credential_ref,
+        config={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_monitoring_only_reports_no_implemented_live_source_and_decrypts_nothing(
+    monkeypatch,
+) -> None:
+    """REAL resolver, REAL `MonitoringLiveSource`: an org whose only live
+    connector is the monitoring stub gets `unavailable` /
+    `no_implemented_live_sources`, the source is never called, and no
+    credential is decrypted.
+    """
+    from app.core.tenancy import service as real_tenancy
+
+    organization_id = uuid.uuid4()
+    monitoring_row = _row(organization_id, "monitoring", "would-be-decrypted-if-the-bug-existed")
+
+    async def fake_rows(session, org_id):
+        return [monitoring_row]
+
+    async def decrypt_must_not_run(kms, encrypted):
+        raise AssertionError("a stub source must never have its credential decrypted")
+
+    called = {"n": 0}
+
+    async def spy_fetch(self, **kwargs):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr(real_tenancy.repository, "list_connector_configs", fake_rows)
+    monkeypatch.setattr(real_tenancy, "decrypt_secret", decrypt_must_not_run)
+    monkeypatch.setattr(MonitoringLiveSource, "fetch_live_evidence", spy_fetch)
+    _stub_incident(monkeypatch, incident=_incident(organization_id))
+
+    items, status = await _live(monkeypatch, actor=_investigator(organization_id))
+
+    assert items == []
+    assert (status.status, status.reason) == ("unavailable", "no_implemented_live_sources")
+    assert [(o.source, o.outcome) for o in status.sources] == [("monitoring", "not_implemented")]
+    assert called["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_github_ok_plus_monitoring_stub_reports_github_ok_and_monitoring_not_implemented(
+    monkeypatch,
+) -> None:
+    from app.core.tenancy import service as real_tenancy
+    from app.shared.security import encrypt_secret, get_kms
+
+    organization_id = uuid.uuid4()
+    github_row = _row(organization_id, "github", await encrypt_secret(get_kms(), _REAL_TOKEN))
+    monitoring_row = _row(organization_id, "monitoring", "not-decryptable-and-must-not-be-touched")
+
+    async def fake_rows(session, org_id):
+        return [github_row, monitoring_row]
+
+    monkeypatch.setattr(real_tenancy.repository, "list_connector_configs", fake_rows)
+    github_item = _item("commit", "r1")
+    fake_github = _FakeLiveSource([github_item])
+    monkeypatch.setattr(
+        evidence_module,
+        "_LIVE_SOURCES",
+        {"github": fake_github, "monitoring": MonitoringLiveSource()},
+    )
+    _stub_incident(monkeypatch, incident=_incident(organization_id))
+
+    items, status = await _live(monkeypatch, actor=_investigator(organization_id))
+
+    assert items == [github_item]
+    assert status.status == "ok"  # the stub neither inflates nor degrades it
+    assert {(o.source, o.outcome) for o in status.sources} == {
+        ("github", "ok"),
+        ("monitoring", "not_implemented"),
+    }
+    assert fake_github.tokens_seen == [_REAL_TOKEN]
+
+
+@pytest.mark.asyncio
+async def test_failure_is_not_diluted_by_a_monitoring_stub(monkeypatch) -> None:
+    _no_sleep(monkeypatch)
+    failing = _FakeLiveSource(error=RuntimeError("boom"))
+    monkeypatch.setattr(
+        evidence_module,
+        "_LIVE_SOURCES",
+        {"github": failing, "monitoring": MonitoringLiveSource()},
+    )
+    _stub_incident(monkeypatch)
+    skip = LiveConnectorSkip(
+        connector_config_id=uuid.uuid4(), source="monitoring", reason="not_implemented"
+    )
+    _stub_resolver(monkeypatch, credentials=[_credential("github")], skipped=[skip])
+
+    _items, status = await _live(monkeypatch)
+
+    assert status.status == "failed"  # monitoring is not a success that makes this "partial"

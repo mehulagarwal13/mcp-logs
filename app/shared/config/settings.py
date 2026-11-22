@@ -12,7 +12,7 @@ meaning of its own, importable by every other module).
 from functools import lru_cache
 from typing import Annotated, ClassVar, Literal
 
-from pydantic import Field, PostgresDsn, RedisDsn, field_validator, model_validator
+from pydantic import Field, PostgresDsn, RedisDsn, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -231,6 +231,67 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Email delivery + email verification --------------------------------
+    # Email ownership verification is ALWAYS enforced by the backend; there is
+    # deliberately no setting that turns it off. These only configure how the
+    # verification mail is delivered. `environment=production` refuses to boot
+    # with `email_provider="none"` (see `_require_email_in_production`), so
+    # production can never silently run without a working delivery path.
+    email_provider: Literal["none", "smtp"] = Field(
+        default="none",
+        description=(
+            "How verification mail is sent. 'smtp' works with any SMTP "
+            "submission service (SES, SendGrid, Mailgun, Postmark all offer "
+            "one). 'none' (default) means no mail can be sent: signup and "
+            "resend return 503 email.not_configured, and production refuses "
+            "to start."
+        ),
+    )
+    email_from_address: str = Field(default="", description="Envelope/From address, e.g. no-reply@example.com.")
+    email_from_name: str = Field(default="EKIP", description="Display name on outgoing mail.")
+    smtp_host: str = Field(default="", description="SMTP submission host.")
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: str = Field(default="")
+    smtp_password: SecretStr = Field(default=SecretStr(""), description="Never logged; supply via environment only.")
+    smtp_security: Literal["starttls", "ssl", "none"] = Field(
+        default="starttls",
+        description="'none' (plaintext) is only honoured for a loopback host such as a local Mailpit.",
+    )
+    smtp_timeout_seconds: float = Field(default=15.0, gt=0)
+    frontend_public_base_url: str = Field(
+        default="http://localhost:5173",
+        description=(
+            "Public origin of the web app, used to build the link in "
+            "verification mail (`<base>/verify-email#token=...`). Must be https "
+            "in production."
+        ),
+    )
+    email_verification_token_ttl_minutes: int = Field(default=1440, ge=5, le=10080)
+    email_verification_resend_cooldown_seconds: int = Field(default=60, ge=0)
+    email_verification_max_sends_per_day: int = Field(default=5, ge=1)
+
+    @model_validator(mode="after")
+    def _require_email_in_production(self) -> "Settings":
+        if self.environment != "production":
+            return self
+        problems: list[str] = []
+        if self.email_provider == "none":
+            problems.append("EMAIL_PROVIDER must not be 'none'")
+        if not self.email_from_address:
+            problems.append("EMAIL_FROM_ADDRESS is required")
+        if self.email_provider == "smtp" and not self.smtp_host:
+            problems.append("SMTP_HOST is required")
+        if self.email_provider == "smtp" and self.smtp_security == "none":
+            problems.append("SMTP_SECURITY must be 'starttls' or 'ssl'")
+        if not self.frontend_public_base_url.startswith("https://"):
+            problems.append("FRONTEND_PUBLIC_BASE_URL must be an https:// URL")
+        if problems:
+            raise ValueError(
+                "environment=production requires working email delivery for email "
+                "verification: " + "; ".join(problems) + "."
+            )
+        return self
+
     # --- MCP server (scripts/run_mcp_server.py) -----------------------------
     mcp_port: int = Field(
         default=8001,
@@ -267,6 +328,55 @@ class Settings(BaseSettings):
             "with `mcp_port` automatically (see `_sync_local_public_base_url_port`) "
             "-- an explicit override (e.g. a real ngrok hostname, which has "
             "no port of its own) always wins outright."
+        ),
+    )
+
+    mcp_oauth_registration_per_ip_per_hour: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Dynamic client registrations (`POST /register`, unauthenticated by "
+            "design) one caller IP may make per hour before being answered 429."
+        ),
+    )
+    mcp_oauth_registrations_per_day: int = Field(
+        default=500,
+        ge=1,
+        description=(
+            "Global ceiling on dynamically registered OAuth clients created in "
+            "any rolling 24 hours; further registrations are refused until "
+            "older ones age out of the window."
+        ),
+    )
+
+    mcp_request_retention_days: int = Field(
+        default=90,
+        ge=1,
+        description=(
+            "How long `mcp_requests` rows are kept. Rows older than this are "
+            "removed by `scripts/purge_mcp_requests.py --apply` (an operator-run "
+            "job; nothing deletes them automatically)."
+        ),
+    )
+    mcp_oauth_client_secret_expiry_days: int = Field(
+        default=180,
+        ge=1,
+        description=(
+            "Lifetime of the client secret issued at dynamic registration. An "
+            "expired secret is refused at `/token` (the client must register "
+            "again). Registered clients that predate this setting and carry no "
+            "expiry are held to the same window, counted from their issue time."
+        ),
+    )
+    mcp_oauth_allowed_redirect_hosts: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["claude.ai", "claude.com"],
+        description=(
+            "Hostnames an OAuth client may register as an `https` redirect "
+            "URI host (exact match, comma-separated via "
+            "MCP_OAUTH_ALLOWED_REDIRECT_HOSTS). `http` redirect URIs are "
+            "accepted only for loopback hosts (localhost, 127.0.0.1, [::1]), "
+            "which native clients such as mcp-remote use; every other scheme "
+            "and host is refused."
         ),
     )
 
@@ -588,6 +698,13 @@ class Settings(BaseSettings):
                 "Set KMS_PROVIDER=azure and its required azure_key_vault_* settings."
             )
         return self
+
+    @field_validator("mcp_oauth_allowed_redirect_hosts", mode="before")
+    @classmethod
+    def _split_mcp_oauth_redirect_hosts(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [host.strip().lower() for host in value.split(",") if host.strip()]
+        return value
 
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod

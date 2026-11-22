@@ -13,7 +13,9 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 
-from sqlalchemy import select, text
+from datetime import datetime
+
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models.core_models import (
@@ -53,6 +55,36 @@ async def get_by_email(session: AsyncSession, email: str) -> User | None:
     stmt = select(User).where(User.email == email)
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+
+async def get_by_email_ci(session: AsyncSession, email: str) -> User | None:
+    """Case-insensitive "does an account with this address exist" lookup.
+
+    `users.email` is a case-sensitive UNIQUE column and legacy rows can be
+    mixed-case, so an exact match would let `Alice@x.com` and `alice@x.com`
+    both exist. Every NEW identity is stored lower-cased; this lookup is what
+    the signup/verification/linking paths use so they can never create a
+    lower-cased twin of a legacy row. Deterministic if (legacy) duplicates
+    exist: exact match first, then oldest.
+    """
+    stmt = (
+        select(User)
+        .where(func.lower(User.email) == email.strip().lower())
+        .order_by((User.email == email).desc(), User.created_at.asc())
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def mark_email_verified(
+    session: AsyncSession, *, user_id: uuid.UUID, verified_at: datetime, via: str
+) -> None:
+    row = await session.get(User, user_id)
+    if row is None:
+        raise ValueError(f"mark_email_verified: no such user {user_id}")
+    row.email_verified_at = verified_at
+    row.email_verified_via = via
+    await session.flush()
 
 
 async def list_organization_members(
@@ -119,7 +151,15 @@ async def get_role_names(
     return result.scalars().all()
 
 
-async def insert_user(session: AsyncSession, *, email: str, display_name: str) -> User:
+async def insert_user(
+    session: AsyncSession,
+    *,
+    email: str,
+    display_name: str,
+    password_hash: str | None = None,
+    email_verified_at: datetime | None = None,
+    email_verified_via: str | None = None,
+) -> User:
     """Create a new user row and return it with server defaults populated.
 
     Called only after a decision to allow provisioning has already been made
@@ -127,7 +167,13 @@ async def insert_user(session: AsyncSession, *, email: str, display_name: str) -
     performs no authorization or policy check of its own; core/users manages
     identity/roles, not who may join an organization.
     """
-    row = User(email=email, display_name=display_name)
+    row = User(
+        email=email,
+        display_name=display_name,
+        password_hash=password_hash,
+        email_verified_at=email_verified_at,
+        email_verified_via=email_verified_via,
+    )
     session.add(row)
     await session.flush()
     await session.refresh(row)
@@ -285,6 +331,102 @@ async def list_organization_ids(session: AsyncSession, user_id: uuid.UUID) -> Se
         {"user_id": str(user_id)},
     )
     return result.scalars().all()
+
+
+async def is_organization_member(
+    session: AsyncSession, user_id: uuid.UUID, organization_id: uuid.UUID
+) -> bool:
+    """Whether `user_id` *currently* holds at least one role in
+    `organization_id` -- EKIP's definition of "current member" until a
+    dedicated membership table exists.
+
+    Filters by organization explicitly even though `user_roles` is also
+    RLS-protected: the application-level filter is the primary check and RLS
+    is the backstop, same as every other org-scoped query in this module.
+    """
+    stmt = (
+        select(func.count())
+        .select_from(UserRole)
+        .where(UserRole.user_id == user_id, UserRole.organization_id == organization_id)
+    )
+    return int((await session.execute(stmt)).scalar_one()) > 0
+
+
+#: Permission code that defines "organization admin" (see `core.tenancy.
+#: service`'s module docstring: admin-ness is holding this code, not a flag).
+_ADMIN_PERMISSION_CODE = "tenancy:manage"
+
+#: First key of the two-key advisory lock below. An arbitrary constant that
+#: only needs to differ from any other advisory-lock namespace in the codebase.
+_ORG_ADMIN_LOCK_NAMESPACE = 7001
+
+
+async def acquire_org_admin_lock(session: AsyncSession, organization_id: uuid.UUID) -> None:
+    """Take a transaction-scoped advisory lock serializing every operation
+    that could shrink `organization_id`'s set of admins.
+
+    Released automatically at commit/rollback (`pg_advisory_xact_lock`), so it
+    is safe with pooled connections. Any code path that removes or demotes an
+    admin MUST take this lock, then re-read the admin set, then decide --
+    see `core.users.service.assert_organization_keeps_an_admin`. A bare row
+    lock is not enough on its own: it makes a concurrent writer wait, but the
+    writer then proceeds on a stale decision unless it re-checks after
+    acquiring the same lock.
+    """
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:namespace, hashtext(:organization_id))"),
+        {"namespace": _ORG_ADMIN_LOCK_NAMESPACE, "organization_id": str(organization_id)},
+    )
+
+
+async def list_org_admin_user_ids(
+    session: AsyncSession, organization_id: uuid.UUID, *, lock: bool
+) -> set[uuid.UUID]:
+    """Ids of the users who can currently act as admins of `organization_id`:
+    they hold a role granting `tenancy:manage` there, and their account is
+    active and email-verified (an account `resolve_identity` would reject
+    cannot exercise admin power, so it must not be counted as a safety net).
+
+    With `lock=True` the matching `user_roles` rows are also locked
+    (`FOR UPDATE OF user_roles`), so a concurrent transaction that tries to
+    delete or change one of them waits for this one to finish. Ordered by
+    `user_id` so two lockers always acquire row locks in the same order. The
+    result is de-duplicated in Python, not with `DISTINCT`, because Postgres
+    rejects `FOR UPDATE` combined with `DISTINCT`.
+    """
+    stmt = (
+        select(UserRole.user_id)
+        .join(RolePermission, RolePermission.role_id == UserRole.role_id)
+        .join(Permission, Permission.id == RolePermission.permission_id)
+        .join(User, User.id == UserRole.user_id)
+        .where(
+            UserRole.organization_id == organization_id,
+            Permission.code == _ADMIN_PERMISSION_CODE,
+            User.is_active.is_(True),
+            User.email_verified_at.is_not(None),
+        )
+        .order_by(UserRole.user_id)
+    )
+    if lock:
+        stmt = stmt.with_for_update(of=UserRole)
+    return set((await session.execute(stmt)).scalars().all())
+
+
+async def lock_user_row(
+    session: AsyncSession, user_id: uuid.UUID, *, exclusive: bool
+) -> bool | None:
+    """Lock the global `users` row of `user_id` until the transaction ends and
+    return its current `is_active`, or `None` if no such user exists.
+
+    `exclusive=True` is `FOR UPDATE` (account deletion/anonymization);
+    `exclusive=False` is `FOR SHARE` (granting a role). The two conflict, so
+    a role grant and an account anonymization for the same person are
+    serialized, and -- Postgres re-reads the row after waiting -- whichever
+    runs second sees the first one's committed result (a grant after an
+    anonymization reads `is_active=False`).
+    """
+    stmt = select(User.is_active).where(User.id == user_id).with_for_update(read=not exclusive)
+    return (await session.execute(stmt)).scalar_one_or_none()
 
 
 async def get_or_create_permissions(session: AsyncSession, codes: Sequence[str]) -> list[Permission]:

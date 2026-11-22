@@ -22,7 +22,7 @@ import httpx
 from jose import JWTError, jwt as jose_jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth import repository
+from app.core.auth import email_verification, repository
 from app.core.auth.schemas import (
     LoginRequest,
     LoginResponse,
@@ -287,58 +287,32 @@ async def complete_sso_login(
 # downstream check (REST, MCP, RLS), from an SSO-authenticated one.
 
 
-async def signup(session: AsyncSession, data: SignupRequest) -> SessionTokens:
-    """Create a brand-new organization and its first (admin) user, and log
-    them in.
+async def signup(
+    session: AsyncSession, data: SignupRequest
+) -> email_verification.PendingDelivery | None:
+    """Begin a self-service signup. **Creates nothing that confers access.**
 
-    There is no "join an existing organization via signup" flow -- every
-    signup creates a fresh `organizations` row (reusing `core.tenancy.
-    service.create_organization`, the same function SSO auto-provisioning
-    and the dev bootstrap scripts already call) together with a "General"
-    default project. A second person joining that organization later is a
-    separate, already-built flow (`core.tenancy.service.create_invitation`/
-    `accept_invitation`), not something this function does.
+    No organization, user, role or session exists after this call: it only
+    records a pending registration (display name, bcrypt hash, organization
+    name/slug) and returns the verification mail to send -- or `None` when no
+    mail should go out (the address already has an account, or sending is
+    rate limited), which the caller must present identically. The account is
+    created, as admin of its new organization, by
+    `email_verification.verify_token` once the mailbox owner proves control;
+    they then sign in through the normal login endpoint.
 
-    Raises `ConflictError` if `data.email` already has an account (whether
-    password- or SSO-provisioned -- `get_credential_lookup` doesn't
-    distinguish, since "an account with this email exists" is true either
-    way) or if `data.organization_slug` is already taken (surfaced by
-    `create_organization` itself).
+    The password is hashed before any lookup so the time taken does not
+    depend on whether the address is already registered.
     """
-    existing = await users_service.get_credential_lookup(session, data.email)
-    if existing is not None:
-        raise ConflictError(
-            "An account with this email already exists.",
-            error_code="auth.email_taken",
-            detail={"email": data.email},
-        )
-
-    organization = await tenancy_service.create_organization(
+    password_hash = _hash_password(data.password)
+    return await email_verification.start_registration(
         session,
-        OrganizationCreate(name=data.organization_name, slug=data.organization_slug),
+        email=data.email,
+        display_name=data.display_name,
+        password_hash=password_hash,
+        organization_name=data.organization_name,
+        organization_slug=data.organization_slug,
     )
-
-    user_id = await users_service.get_or_create_user(
-        session, email=data.email, display_name=data.display_name
-    )
-    await users_service.set_password(
-        session, user_id=user_id, password_hash=_hash_password(data.password)
-    )
-
-    role_id = await users_service.ensure_admin_role(session)
-    await users_service.assign_role(
-        session, user_id=user_id, organization_id=organization.id, role_id=role_id
-    )
-
-    tokens = await _issue_session(
-        session, user_id=user_id, organization_id=organization.id, family_id=uuid.uuid4()
-    )
-    logger.info(
-        "password_signup_completed",
-        user_id=str(user_id),
-        organization_id=str(organization.id),
-    )
-    return tokens
 
 
 async def login_with_password(session: AsyncSession, data: LoginRequest) -> LoginResponse:
@@ -380,6 +354,15 @@ async def login_with_password(session: AsyncSession, data: LoginRequest) -> Logi
         raise PermissionDeniedError(
             "This account is inactive.", error_code="user.inactive"
         )
+    # Only reachable with the CORRECT password, so this reveals nothing to a
+    # caller who does not already hold the credential. No access token and
+    # no organization-selection token is issued for an unproven address.
+    if lookup.email_verified_at is None:
+        raise PermissionDeniedError(
+            "Your email address has not been verified. Open the confirmation link we "
+            "emailed you, or request a new one.",
+            error_code="auth.email_not_verified",
+        )
 
     organization_ids = await users_service.list_organizations_for_login(session, lookup.user_id)
     if len(organization_ids) == 0:
@@ -417,37 +400,40 @@ async def login_with_password(session: AsyncSession, data: LoginRequest) -> Logi
 
 async def accept_invitation_with_password(
     session: AsyncSession, invitation_id: uuid.UUID, data: InvitationAcceptRequest
-) -> SessionTokens:
-    """Accept a password-organization invitation: prove control of the
-    invited email address via `data.token`, provision a real account with
-    `data.password` set, assign the invitation's `grants_role_id`, mark the
-    invitation consumed, and log the new user in -- Phase 7.5's fix for a
-    confirmed gap where `core.tenancy.service.accept_invitation` (still
-    called at the end of this function, unchanged) only ever flipped the
-    invitation's own status flag, provisioning nothing: calling it directly
-    permanently consumed the invitation with no account, no role, and no
-    session to show for it.
+) -> email_verification.PendingDelivery | None:
+    """Start accepting a password-organization invitation.
 
-    Deliberately NOT added to `core.tenancy.service.accept_invitation`
-    itself: that function is also the SSO-login-time acceptance path
-    (`_resolve_or_provision_user` below calls it with no token at all,
-    correctly -- an SSO login's signed `id_token` already proves identity, a
-    separate token would be redundant), and `core.tenancy` cannot import
-    `core.auth` (this module) to reach `_issue_session`/password hashing
-    without creating a circular import (`core.auth` already depends on
-    `core.tenancy`, per this module's own docstring) -- so the password-
-    specific orchestration lives here instead, calling into
-    `core.tenancy`'s already-existing, unmodified validation/status-update
-    function once its own checks pass.
+    The invitation token is NOT proof of mailbox control: it is returned to
+    the *admin* who creates the invitation. The previous implementation
+    trusted it as such and (a) adopted any EXISTING account with the invited
+    email, (b) overwrote that account's password and (c) issued it a session
+    -- an organization admin could take over any EKIP account whose email
+    they could name. That is removed:
 
-    Raises the same `NotFoundError`/`ConflictError` shapes `accept_invitation`
-    itself would for a missing/non-pending/expired invitation (checked here
-    too, before provisioning a user for an invitation that's about to be
-    rejected anyway), plus `PermissionDeniedError` for a token mismatch --
-    deliberately the same exception type/status (403) `login_with_password`
-    uses for "invalid credentials," so this endpoint can't be used to
-    distinguish "wrong token" from any other failure shape either.
+    * an invitation + token (checked exactly as before) only authorises
+      *starting* acceptance;
+    * if an account already exists for the address -> 409
+      `invitation.account_exists` (nothing is overwritten, nothing issued);
+    * otherwise a pending `invitation` verification is recorded with the
+      bcrypt hash and a confirmation mail is sent to the invited address. The
+      invitation stays `pending`; the user, role and invitation consumption
+      happen in `email_verification.verify_token` when the mailbox owner
+      proves control. No session is returned -- they sign in afterwards.
+
+    The invitation's organization is resolved through the narrow
+    `resolve_invitation_organization` function and tenant context is set
+    before any RLS-protected read (this endpoint is unauthenticated, so
+    without it `invitations` was unreadable on the real `ekip_app` role).
     """
+    organization_id = await repository.resolve_invitation_organization_id(session, invitation_id)
+    if organization_id is None:
+        raise NotFoundError(
+            "Invitation not found.",
+            error_code="invitation.not_found",
+            detail={"invitation_id": str(invitation_id)},
+        )
+    await set_tenant_context(session, organization_id)
+
     invitation = await tenancy_repository.get_invitation_by_id(session, invitation_id)
     if invitation is None:
         raise NotFoundError(
@@ -473,32 +459,22 @@ async def accept_invitation_with_password(
             "This invitation has expired.",
             error_code="invitation.expired",
         )
+    if await users_service.find_user_id_by_email_ci(session, invitation.email) is not None:
+        raise ConflictError(
+            "An account with this email already exists. Sign in instead.",
+            error_code="invitation.account_exists",
+        )
 
-    user_id = await users_service.get_or_create_user(
-        session, email=invitation.email, display_name=data.display_name or invitation.email
-    )
-    await users_service.set_password(session, user_id=user_id, password_hash=_hash_password(data.password))
-    await users_service.assign_role(
+    password_hash = _hash_password(data.password)
+    delivery = await email_verification.start_invitation_acceptance(
         session,
-        user_id=user_id,
-        organization_id=invitation.organization_id,
-        role_id=invitation.grants_role_id,
+        invitation_id=invitation.id,
+        email=invitation.email,
+        display_name=data.display_name or invitation.email,
+        password_hash=password_hash,
     )
-    # Re-validates status/expiry itself and marks `status="accepted"` --
-    # harmless, intentional double-checking rather than trusting the checks
-    # above stayed true for the entire duration of the provisioning calls.
-    await tenancy_service.accept_invitation(session, invitation_id)
-
-    tokens = await _issue_session(
-        session, user_id=user_id, organization_id=invitation.organization_id, family_id=uuid.uuid4()
-    )
-    logger.info(
-        "invitation_accepted_with_password",
-        user_id=str(user_id),
-        organization_id=str(invitation.organization_id),
-        invitation_id=str(invitation_id),
-    )
-    return tokens
+    logger.info("invitation_acceptance_pending_verification", invitation_id=str(invitation_id))
+    return delivery
 
 
 async def _resolve_client_secret(client_secret_ref: str) -> str:
@@ -599,10 +575,26 @@ async def _exchange_code_for_claims(
         ) from exc
 
     email = claims.get("email")
-    if not email:
+    if not isinstance(email, str) or not email.strip():
         raise PermissionDeniedError(
-            "IdP did not provide a verified email claim.",
+            "IdP did not provide an email claim.",
             error_code="auth.idp_response_invalid",
+        )
+
+    # An email is only trusted on AFFIRMATIVE evidence of ownership from the
+    # provider; a missing, false or wrongly-typed claim is a rejection, never
+    # a pass. Evaluated after signature/iss/aud/exp above, which are unchanged.
+    verification_source = _idp_email_verification(sso_config.provider, claims)
+    if verification_source is None:
+        logger.warning(
+            "sso_login_rejected_unverified_email",
+            organization_id=str(sso_config.organization_id),
+            provider=sso_config.provider,
+        )
+        raise PermissionDeniedError(
+            "The identity provider did not verify this email address, so it cannot be "
+            "used to sign in or be provisioned.",
+            error_code="auth.idp_email_not_verified",
         )
 
     return VerifiedIdPClaims(
@@ -610,7 +602,32 @@ async def _exchange_code_for_claims(
         email=email,
         name=claims.get("name"),
         groups=tuple(claims.get("groups") or ()),
+        email_verified=True,
+        email_verification_source=verification_source,
     )
+
+
+def _idp_email_verification(provider: str, claims: dict) -> str | None:
+    """Name of the claim that proves the IdP verified `claims["email"]`, or
+    None if there is no such proof. Strict: only a JSON boolean `true`
+    counts -- `"true"`, `1`, `null`, a missing claim and `false` do not.
+
+    Provider contracts (docs/security/email-verification-audit.md section 3):
+
+    * Google / Google Workspace, Okta, Auth0: the standard OIDC boolean
+      `email_verified`.
+    * Microsoft Entra ID does not emit `email_verified` by default, and its
+      `email` claim is mutable and not guaranteed verified. The only
+      equivalent evidence is the optional boolean claim `xms_edov` (email
+      domain owner verified), which a tenant must enable on the app
+      registration. Without one of the two, an Entra login is rejected rather
+      than trusting the address.
+    """
+    if claims.get("email_verified") is True:
+        return "email_verified"
+    if provider == "entra_id" and claims.get("xms_edov") is True:
+        return "xms_edov"
+    return None
 
 
 async def _resolve_or_provision_user(
@@ -631,11 +648,31 @@ async def _resolve_or_provision_user(
     own job is orchestration only: ask tenancy for a decision, and only if
     it's allowed, ask core/users to create/resolve the user and grant the
     role, then record the mapping so this becomes a no-op on the next login.
+
+    The tenant context is set explicitly first: `external_identity_mappings`
+    is RLS-protected, and this lookup is the first query of the SSO
+    provisioning path -- before `evaluate_provisioning` (which sets the same
+    context itself) ever runs. Without it, a returning user's existing
+    mapping is invisible (or the query errors under a reused connection's
+    empty setting), so the login would try to provision and re-insert the
+    mapping instead of resolving it. `organization_id` is the organization
+    this login is already committed to, not caller-supplied free input.
     """
+    # Defence in depth: `_exchange_code_for_claims` already refuses an
+    # unverified email, but nothing downstream (invitation matching, domain
+    # rules, account linking) may ever run on one, whatever built `idp_claims`.
+    if not idp_claims.email_verified:
+        raise PermissionDeniedError(
+            "The identity provider did not verify this email address.",
+            error_code="auth.idp_email_not_verified",
+        )
+
+    await set_tenant_context(session, organization_id)
     mapping = await repository.get_external_identity_mapping(
         session, organization_id, idp_subject
     )
     if mapping is not None:
+        await _ensure_mapped_user_email_verified(session, mapping.user_id, idp_claims)
         return mapping.user_id
 
     decision = await tenancy_service.evaluate_provisioning(
@@ -668,7 +705,9 @@ async def _resolve_or_provision_user(
             "evaluate_provisioning returned allowed=True with no grants_role_id."
         )
 
-    user_id = await users_service.get_or_create_user(
+    # New user (created verified, `via=oidc`), or an EXISTING account only if
+    # its own email is already verified -- never linked by email string alone.
+    user_id = await users_service.resolve_user_for_sso_provisioning(
         session, email=idp_claims.email, display_name=idp_claims.name or idp_claims.email
     )
     await users_service.assign_role(
@@ -693,6 +732,34 @@ async def _resolve_or_provision_user(
     return user_id
 
 
+async def _ensure_mapped_user_email_verified(
+    session: AsyncSession, user_id: uuid.UUID, idp_claims: VerifiedIdPClaims
+) -> None:
+    """A returning SSO user whose EKIP account predates email verification.
+
+    The IdP has just proven `idp_claims.email`. That is sufficient to mark the
+    account verified ONLY when it has no local password (so there is no second
+    credential a squatter could hold) and the proven address is the account's
+    own. Anything else stays blocked until the owner verifies via the emailed
+    link (which also revokes old sessions).
+    """
+    state = await users_service.get_user_email_state_by_id(session, user_id)
+    if state is None or state.email_verified_at is not None:
+        return
+    if (
+        state.is_active
+        and not state.has_password
+        and state.email.strip().lower() == idp_claims.email.strip().lower()
+    ):
+        await users_service.mark_email_verified(session, user_id=user_id, via="oidc")
+        return
+    raise PermissionDeniedError(
+        "This account's email address has not been verified. Use the verification email "
+        "to verify it, then sign in again.",
+        error_code="auth.email_not_verified",
+    )
+
+
 # --- Session issuance, refresh, logout -------------------------------------------
 
 
@@ -705,8 +772,20 @@ def _hash_token(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
 
-def _issue_access_token(user_id: uuid.UUID, organization_id: uuid.UUID) -> tuple[str, datetime, datetime]:
+def _issue_access_token(
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    *,
+    scope: str | None = None,
+    audience: str | None = None,
+    issuer: str | None = None,
+) -> tuple[str, datetime, datetime]:
     """Sign a new access token, returning (token, issued_at, expires_at).
+
+    `scope` (space-separated, RFC 9068 `scope` claim), `audience` (`aud`) and
+    `issuer` (`iss`) are set only for tokens issued through the MCP OAuth
+    bridge; an ordinary REST session token has none of them. `verify_access_
+    token` uses that to keep each kind out of the other's resource.
 
     `"type": "access"` is new, additive: it lets `verify_access_token`
     reject a well-signed-but-wrong-kind-of token (specifically, an
@@ -725,6 +804,12 @@ def _issue_access_token(user_id: uuid.UUID, organization_id: uuid.UUID) -> tuple
         "iat": int(issued_at.timestamp()),
         "exp": int(expires_at.timestamp()),
     }
+    if scope:
+        claims["scope"] = scope
+    if audience:
+        claims["aud"] = audience
+    if issuer:
+        claims["iss"] = issuer
     token = jose_jwt.encode(claims, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
     return token, issued_at, expires_at
 
@@ -795,7 +880,15 @@ def _verify_org_selection_token(token: str) -> uuid.UUID:
 
 
 async def _issue_session(
-    session: AsyncSession, *, user_id: uuid.UUID, organization_id: uuid.UUID, family_id: uuid.UUID
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    family_id: uuid.UUID,
+    scope: str | None = None,
+    oauth_client_id: str | None = None,
+    audience: str | None = None,
+    issuer: str | None = None,
 ) -> SessionTokens:
     """Issue one access token + one new refresh token, persisting the latter.
 
@@ -822,7 +915,9 @@ async def _issue_session(
     `neondb_owner` every environment used until now).
     """
     await set_tenant_context(session, organization_id)
-    access_token, issued_at, access_expires_at = _issue_access_token(user_id, organization_id)
+    access_token, issued_at, access_expires_at = _issue_access_token(
+        user_id, organization_id, scope=scope, audience=audience, issuer=issuer
+    )
     raw_refresh_token = secrets.token_urlsafe(48)
     refresh_expires_at = issued_at + _REFRESH_TOKEN_LIFETIME
 
@@ -833,6 +928,7 @@ async def _issue_session(
         family_id=family_id,
         token_hash=_hash_token(raw_refresh_token),
         expires_at=refresh_expires_at,
+        **({"oauth_client_id": oauth_client_id} if oauth_client_id else {}),
     )
 
     return SessionTokens(
@@ -865,8 +961,20 @@ async def peek_refresh_token(session: AsyncSession, raw_token: str):
     return row
 
 
-async def refresh(session: AsyncSession, data: RefreshRequest) -> SessionTokens:
+async def refresh(
+    session: AsyncSession,
+    data: RefreshRequest,
+    *,
+    scope: str | None = None,
+    oauth_client_id: str | None = None,
+    audience: str | None = None,
+    issuer: str | None = None,
+) -> SessionTokens:
     """Exchange a still-valid refresh token for a new session (rotation).
+
+    `scope`, if given, is carried into the new access token (the MCP OAuth
+    bridge passes its scope here); REST callers pass nothing and get exactly
+    the token they always did.
 
     Reuse detection (RefreshToken's model docstring): if the presented token
     has already been revoked (i.e. already rotated away, or already logged
@@ -901,6 +1009,15 @@ async def refresh(session: AsyncSession, data: RefreshRequest) -> SessionTokens:
             "Invalid refresh token.", error_code="auth.invalid_refresh_token"
         )
 
+    # A token bound to an OAuth client can only be refreshed BY that client,
+    # and an unbound (REST) token can never be refreshed through an OAuth
+    # client. A mismatch is a wrong-presenter error, not evidence the token was
+    # replayed, so it neither rotates nor revokes anything.
+    if row.oauth_client_id != oauth_client_id:
+        raise PermissionDeniedError(
+            "Invalid refresh token.", error_code="auth.invalid_refresh_token"
+        )
+
     if row.revoked_at is not None:
         await repository.revoke_family(session, row.family_id, revoked_at=now)
         logger.warning(
@@ -918,14 +1035,44 @@ async def refresh(session: AsyncSession, data: RefreshRequest) -> SessionTokens:
             "Refresh token has expired.", error_code="auth.refresh_token_expired"
         )
 
+    # A refresh token must not outlive the account state that made it
+    # acceptable: an inactive or unverified account gets nothing new. Raising
+    # here also leaves the token un-rotated (the request transaction rolls back).
+    state = await users_service.get_user_email_state_by_id(session, row.user_id)
+    if state is None or not state.is_active:
+        raise PermissionDeniedError("This account is inactive.", error_code="user.inactive")
+    if state.email_verified_at is None:
+        raise PermissionDeniedError(
+            "This account's email address has not been verified.",
+            error_code="auth.email_not_verified",
+        )
+
     await repository.revoke_refresh_token(session, row.id, revoked_at=now)
+    extra: dict[str, str] = {}
+    if scope:
+        extra["scope"] = scope
+    if row.oauth_client_id:
+        extra["oauth_client_id"] = row.oauth_client_id
+    if audience:
+        extra["audience"] = audience
+    if issuer:
+        extra["issuer"] = issuer
     return await _issue_session(
-        session, user_id=row.user_id, organization_id=row.organization_id, family_id=row.family_id
+        session,
+        user_id=row.user_id,
+        organization_id=row.organization_id,
+        family_id=row.family_id,
+        **extra,
     )
 
 
-async def logout(session: AsyncSession, data: RefreshRequest) -> None:
+async def logout(
+    session: AsyncSession, data: RefreshRequest, *, oauth_client_id: str | None = None
+) -> None:
     """Revoke the single session identified by `data.refresh_token`.
+
+    A token bound to an OAuth client is revoked only when that same client
+    presents it (`oauth_client_id`); any other presenter is a silent no-op.
 
     Idempotent: logging out a token that's already invalid/gone is a no-op,
     not an error -- a client retrying a logout call should never see a
@@ -947,6 +1094,8 @@ async def logout(session: AsyncSession, data: RefreshRequest) -> None:
 
     row = await repository.get_refresh_token_by_hash(session, token_hash)
     if row is None or row.revoked_at is not None:
+        return
+    if row.oauth_client_id != oauth_client_id:
         return
     await repository.revoke_refresh_token(session, row.id, revoked_at=datetime.now(timezone.utc))
 
@@ -970,8 +1119,16 @@ async def revoke_all_sessions(
 # --- Access token verification ------------------------------------------------
 
 
-def verify_access_token(token: str) -> TokenClaims:
+def verify_access_token(
+    token: str, *, audience: str | None = None, issuer: str | None = None
+) -> TokenClaims:
     """Verify and decode an access token, returning its claims.
+
+    Resource binding: with no `audience`/`issuer` (the REST API) a token that
+    carries an `aud` claim -- i.e. one issued to the MCP resource -- is
+    REJECTED. With an `audience` and `issuer` (the MCP server) the token must
+    carry exactly that `aud` and `iss`, so an ordinary REST session token is
+    refused there. Neither kind of token works in the other's resource.
 
     No database access, by design (mirrors this file's module docstring):
     this answers "whose token is this, and is it validly signed and
@@ -994,7 +1151,11 @@ def verify_access_token(token: str) -> TokenClaims:
     settings = get_settings()
     try:
         claims = jose_jwt.decode(
-            token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm]
+            token,
+            settings.jwt_secret_key,
+            algorithms=[settings.jwt_algorithm],
+            audience=audience,
+            issuer=issuer,
         )
     except JWTError as exc:
         raise PermissionDeniedError(
@@ -1006,12 +1167,29 @@ def verify_access_token(token: str) -> TokenClaims:
             "This token is not a valid access token.", error_code="auth.invalid_token"
         )
 
+    # `jose` validates `aud`/`iss` only when the claim is present, so a token
+    # that simply omits them would pass the decode above. When the caller names
+    # a resource it must be bound to it: require the claims to be there.
+    if audience is not None:
+        token_audience = claims.get("aud")
+        if token_audience != audience and not (
+            isinstance(token_audience, list) and audience in token_audience
+        ):
+            raise PermissionDeniedError(
+                "This token was not issued for this resource.", error_code="auth.invalid_token"
+            )
+    if issuer is not None and claims.get("iss") != issuer:
+        raise PermissionDeniedError(
+            "This token was not issued by the expected issuer.", error_code="auth.invalid_token"
+        )
+
     try:
         return TokenClaims(
             user_id=uuid.UUID(claims["sub"]),
             organization_id=uuid.UUID(claims["organization_id"]),
             issued_at=datetime.fromtimestamp(claims["iat"], tz=timezone.utc),
             expires_at=datetime.fromtimestamp(claims["exp"], tz=timezone.utc),
+            scopes=tuple(str(claims.get("scope", "")).split()),
         )
     except (KeyError, ValueError) as exc:
         raise PermissionDeniedError(
@@ -1037,6 +1215,15 @@ async def select_organization(session: AsyncSession, data: OrganizationSelection
     get written into a token without that membership check running first.
     """
     user_id = _verify_org_selection_token(data.selection_token)
+    # The selection token can predate a state change: re-check the account.
+    state = await users_service.get_user_email_state_by_id(session, user_id)
+    if state is None or not state.is_active:
+        raise PermissionDeniedError("This account is inactive.", error_code="user.inactive")
+    if state.email_verified_at is None:
+        raise PermissionDeniedError(
+            "This account's email address has not been verified.",
+            error_code="auth.email_not_verified",
+        )
     organization_ids = await users_service.list_organizations_for_login(session, user_id)
     if data.organization_id not in organization_ids:
         raise PermissionDeniedError(

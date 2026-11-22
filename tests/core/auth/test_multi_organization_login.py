@@ -29,6 +29,7 @@ patched functions never actually touch it, mirroring
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 
@@ -42,11 +43,35 @@ from app.core.auth.schemas import (
     SwitchOrganizationRequest,
 )
 from app.core.exceptions import PermissionDeniedError
-from app.core.users.schemas import UserCredentialLookup
+from app.core.users.schemas import UserCredentialLookup, UserEmailState
 
 
-def _make_lookup(*, user_id: uuid.UUID, password_hash: str = "hashed", is_active: bool = True):
-    return UserCredentialLookup(user_id=user_id, password_hash=password_hash, is_active=is_active)
+def _make_lookup(
+    *,
+    user_id: uuid.UUID,
+    password_hash: str = "hashed",
+    is_active: bool = True,
+    verified: bool = True,
+):
+    return UserCredentialLookup(
+        user_id=user_id,
+        password_hash=password_hash,
+        is_active=is_active,
+        email_verified_at=datetime.now(timezone.utc) if verified else None,
+    )
+
+
+def _patch_user_state(monkeypatch, *, verified: bool = True, active: bool = True) -> None:
+    async def fake_state(session, user_id):
+        return UserEmailState(
+            user_id=user_id,
+            email="person@example.com",
+            email_verified_at=datetime.now(timezone.utc) if verified else None,
+            is_active=active,
+            has_password=True,
+        )
+
+    monkeypatch.setattr(auth_service.users_service, "get_user_email_state_by_id", fake_state)
 
 
 def _patch_password_check(monkeypatch, *, ok: bool = True) -> None:
@@ -212,6 +237,7 @@ async def test_switch_organization_rejects_non_member_organization(monkeypatch) 
 
 @pytest.mark.asyncio
 async def test_select_organization_rejects_non_member_organization(monkeypatch) -> None:
+    _patch_user_state(monkeypatch)
     user_id = uuid.uuid4()
     member_org = uuid.uuid4()
     non_member_org = uuid.uuid4()
@@ -276,6 +302,7 @@ async def test_switch_organization_issues_token_for_selected_organization(monkey
 
 @pytest.mark.asyncio
 async def test_select_organization_issues_token_for_chosen_organization(monkeypatch) -> None:
+    _patch_user_state(monkeypatch)
     user_id = uuid.uuid4()
     org_a, org_b = uuid.uuid4(), uuid.uuid4()
     selection_token, _ = auth_service._issue_org_selection_token(user_id)
@@ -456,3 +483,98 @@ def test_pre_existing_access_token_without_type_claim_still_verifies() -> None:
 
     assert claims.user_id == user_id
     assert claims.organization_id == organization_id
+
+
+# --- Email verification enforcement ---------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("org_count", [1, 2])
+async def test_unverified_user_cannot_log_in_and_receives_no_token_of_any_kind(
+    monkeypatch, org_count
+) -> None:
+    """A correct password is not enough for an account whose email ownership was
+    never proven: no session, and no organization-selection token either (which
+    would otherwise be exchangeable for a session via select_organization)."""
+    user_id = uuid.uuid4()
+    lookup = _make_lookup(user_id=user_id, verified=False)
+
+    async def fake_get_credential_lookup(session, email):
+        return lookup
+
+    async def fake_list_organizations_for_login(session, uid):
+        return [uuid.uuid4() for _ in range(org_count)]
+
+    _patch_password_check(monkeypatch)
+    monkeypatch.setattr(auth_service.users_service, "get_credential_lookup", fake_get_credential_lookup)
+    monkeypatch.setattr(
+        auth_service.users_service, "list_organizations_for_login", fake_list_organizations_for_login
+    )
+    issue_calls = _patch_issue_session(monkeypatch)
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await auth_service.login_with_password(
+            None, LoginRequest(email="a@example.com", password="correct-password")
+        )
+
+    assert exc_info.value.error_code == "auth.email_not_verified"
+    assert issue_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unverified_login_check_is_only_reached_with_the_correct_password(monkeypatch) -> None:
+    """No enumeration: a WRONG password for an unverified account looks exactly
+    like a wrong password for any account (`auth.invalid_credentials`), so the
+    `email_not_verified` signal is only ever shown to someone holding the credential."""
+    lookup = _make_lookup(user_id=uuid.uuid4(), verified=False)
+
+    async def fake_get_credential_lookup(session, email):
+        return lookup
+
+    _patch_password_check(monkeypatch, ok=False)
+    monkeypatch.setattr(auth_service.users_service, "get_credential_lookup", fake_get_credential_lookup)
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await auth_service.login_with_password(
+            None, LoginRequest(email="a@example.com", password="wrong")
+        )
+
+    assert exc_info.value.error_code == "auth.invalid_credentials"
+
+
+@pytest.mark.asyncio
+async def test_select_organization_refuses_a_selection_token_for_a_now_unverified_user(
+    monkeypatch,
+) -> None:
+    user_id = uuid.uuid4()
+    org = uuid.uuid4()
+    selection_token, _ = auth_service._issue_org_selection_token(user_id)
+    _patch_user_state(monkeypatch, verified=False)
+    issue_calls = _patch_issue_session(monkeypatch)
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await auth_service.select_organization(
+            None, OrganizationSelectionRequest(selection_token=selection_token, organization_id=org)
+        )
+
+    assert exc_info.value.error_code == "auth.email_not_verified"
+    assert issue_calls == []
+
+
+@pytest.mark.asyncio
+async def test_select_organization_refuses_a_selection_token_for_a_now_inactive_user(
+    monkeypatch,
+) -> None:
+    user_id = uuid.uuid4()
+    selection_token, _ = auth_service._issue_org_selection_token(user_id)
+    _patch_user_state(monkeypatch, active=False)
+    issue_calls = _patch_issue_session(monkeypatch)
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await auth_service.select_organization(
+            None,
+            OrganizationSelectionRequest(selection_token=selection_token, organization_id=uuid.uuid4()),
+        )
+
+    assert exc_info.value.error_code == "user.inactive"
+    assert issue_calls == []

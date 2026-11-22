@@ -23,7 +23,7 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.database.session import Base, _build_engine, engine
+from app.database.session import Base, _build_engine
 from app.shared.config.settings import get_settings
 
 # Import every model module here so its tables register on Base.metadata
@@ -88,10 +88,17 @@ async def run_migrations_online() -> None:
     with a differently-valued `DATABASE_URL` and never set
     `migration_database_url` at all.
     """
+    # Always a dedicated engine with NO client-side command timeout: migrations
+    # (e.g. the HNSW index builds) can run far longer than the 30 s bound the
+    # request-serving engines use, and asyncpg's client-side timeout would
+    # cancel them mid-build. Without `migration_database_url` this is built
+    # from the same `database_url` the shared engine uses.
     if _settings.migration_database_url is not None:
-        connectable: AsyncEngine = _build_engine(str(_settings.migration_database_url))
+        connectable: AsyncEngine = _build_engine(
+            str(_settings.migration_database_url), command_timeout=None
+        )
     else:
-        connectable = engine
+        connectable = _build_engine(command_timeout=None)
 
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

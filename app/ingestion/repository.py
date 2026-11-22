@@ -25,6 +25,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
+from sqlalchemy import delete as sql_delete
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -281,6 +282,146 @@ async def insert_document(
     session.add(row)
     await session.flush()
     return row
+
+
+# --- Document version lifecycle ---------------------------------------------
+#
+# A changed connector document becomes a new `documents` row (`version + 1`);
+# the previous row is *superseded* (`superseded_at` set), never deleted, so
+# every old `document_id` -- and therefore every citation naming it -- keeps
+# resolving. These functions are the per-item building blocks
+# `app.ingestion.service._process_one_item` runs inside its savepoint; none of
+# them commits.
+
+
+async def lock_document_key(
+    session: AsyncSession, organization_id: uuid.UUID, source: str, external_id: str
+) -> None:
+    """Serialize writers of one logical document (organization, source,
+    external_id) for the rest of the current transaction.
+
+    A transaction-scoped Postgres advisory lock -- released automatically at
+    COMMIT or ROLLBACK, never leaked -- so it holds even when the Redis
+    per-connector lock (`ingestion.workers.tasks._acquire_connector_lock`)
+    fails open or two different connector configs ingest the same item. The
+    key is derived from the organization too, so tenants never contend with
+    each other. Advisory locks are not subject to RLS and expose no rows.
+
+    Callers must re-read state AFTER acquiring this lock: a concurrent writer
+    may have finished between their first read and the lock being granted.
+    """
+    key = f"{organization_id}:{source}:{external_id}"
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": key}
+    )
+
+
+async def find_document_by_content_hash(
+    session: AsyncSession,
+    organization_id: uuid.UUID,
+    source: str,
+    external_id: str,
+    content_hash: str,
+) -> Document | None:
+    """Fetch the row (any version) already holding this exact idempotency key
+    `(organization_id, source, external_id, content_hash)`, or None.
+
+    `uq_documents_org_source_external_hash` guarantees there is at most one.
+    This is how an A -> B -> A content revert is detected: the old A row
+    still exists (superseded), and inserting a second A row would violate that
+    constraint.
+    """
+    stmt = select(Document).where(
+        Document.organization_id == organization_id,
+        Document.source == source,
+        Document.external_id == external_id,
+        Document.content_hash == content_hash,
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def revive_document(
+    session: AsyncSession,
+    row: Document,
+    *,
+    version: int,
+    project_id: uuid.UUID,
+    title: str | None,
+    source_url: str | None,
+) -> Document:
+    """Make a previously superseded row the current version again (the
+    revert case) instead of inserting a duplicate-hash row.
+
+    `version` is set to the new highest version so "highest version = current"
+    stays true for `get_latest_document`. `title`/`source_url`/`project_id`
+    are refreshed from the item being ingested now (they are not part of the
+    content hash, so they may have changed). `acl_permission_code`, `status`
+    and `created_at` are left as they were. The caller must replace the row's
+    metadata and chunks -- see `replace_document_metadata` and
+    `retrieval.service.delete_document`.
+    """
+    row.superseded_at = None
+    row.version = version
+    row.project_id = project_id
+    row.title = title
+    row.source_url = source_url
+    await session.flush()
+    return row
+
+
+async def supersede_other_versions(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+    source: str,
+    external_id: str,
+    keep_document_id: uuid.UUID,
+) -> list[uuid.UUID]:
+    """Mark every OTHER not-yet-superseded row of this logical document as
+    superseded, returning their ids so the caller can purge their chunks.
+
+    Marking *all* of them (not just the immediately preceding version) makes
+    ingestion self-healing for documents whose history predates this column:
+    any key ingestion touches ends with exactly one current row, whether or
+    not `scripts/backfill_superseded_documents.py` has run yet. Idempotent --
+    already-superseded rows are skipped by the `IS NULL` predicate.
+    `updated_at` is carried over unchanged: superseding is bookkeeping, not
+    an edit of that row's content.
+    """
+    stmt = (
+        update(Document)
+        .where(
+            Document.organization_id == organization_id,
+            Document.source == source,
+            Document.external_id == external_id,
+            Document.superseded_at.is_(None),
+            Document.id != keep_document_id,
+        )
+        .values(superseded_at=func.now(), updated_at=Document.updated_at)
+        .returning(Document.id)
+        .execution_options(synchronize_session=False)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def replace_document_metadata(
+    session: AsyncSession, *, document_id: uuid.UUID, entries: list[DocumentMetadataEntry]
+) -> None:
+    """Replace ONE document's metadata rows with `entries`.
+
+    Only used when reviving a superseded row, whose old metadata rows describe
+    an earlier fetch of the same content; a brand-new row never needs this
+    (`insert_document_metadata`). Scoped by `document_id` only -- it can never
+    touch another document's metadata.
+    """
+    await session.execute(
+        sql_delete(DocumentMetadata)
+        .where(DocumentMetadata.document_id == document_id)
+        .execution_options(synchronize_session=False)
+    )
+    await insert_document_metadata(session, document_id=document_id, entries=entries)
 
 
 async def get_document_by_id(session: AsyncSession, document_id: uuid.UUID) -> Document | None:

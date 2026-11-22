@@ -20,11 +20,12 @@ requires the caller to send it back.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Response, status
 
-from app.api.deps import CurrentIdentity, DbSession
+from app.api.deps import CurrentIdentity, DbSession, require_email_delivery
 from app.api.rate_limit import rate_limit_by_ip
 from app.core.audit.service import record_audit_event
+from app.core.auth import email_verification
 from app.core.auth import service as auth_service
 from app.core.auth.schemas import (
     LoginRequest,
@@ -33,11 +34,15 @@ from app.core.auth.schemas import (
     OrganizationSelectionRequest,
     OrganizationsListResponse,
     RefreshRequest,
+    ResendVerificationRequest,
     SessionTokens,
     SignupRequest,
     SSOAuthorizationRedirect,
     SSOCallbackRequest,
     SwitchOrganizationRequest,
+    VerificationRequested,
+    VerifyEmailRequest,
+    VerifyEmailResponse,
 )
 from app.core.exceptions import ValidationError
 from app.core.users import service as users_service
@@ -78,19 +83,63 @@ _SIGNUP_RATE_LIMIT = rate_limit_by_ip(scope="auth.signup", requests_per_minute=1
 _LOGIN_RATE_LIMIT = rate_limit_by_ip(scope="auth.login", requests_per_minute=10)
 
 
+# Per-IP, tighter than signup: these accept an unauthenticated email address /
+# token. The per-row DB cooldown + daily cap in `core.auth.email_verification`
+# is the real mail-bombing bound (this Redis limiter fails open).
+_VERIFY_EMAIL_RATE_LIMIT = rate_limit_by_ip(scope="auth.verify_email", requests_per_minute=20)
+_RESEND_RATE_LIMIT = rate_limit_by_ip(scope="auth.resend_verification", requests_per_minute=5)
+
+
 @router.post(
     "/signup",
-    response_model=SessionTokens,
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(_SIGNUP_RATE_LIMIT)],
+    response_model=VerificationRequested,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(_SIGNUP_RATE_LIMIT), Depends(require_email_delivery)],
 )
-async def signup(data: SignupRequest, session: DbSession) -> SessionTokens:
-    """Self-service email/password account creation -- a parallel path
-    alongside the SSO flow above, not a replacement for it. See
-    `auth_service.signup`'s docstring for exactly what it does and does not
-    support (always a brand-new organization; no join-existing-org flow).
+async def signup(
+    data: SignupRequest, session: DbSession, background_tasks: BackgroundTasks
+) -> VerificationRequested:
+    """Begin self-service signup. Creates NO account, organization, role or
+    session -- only a pending registration -- and always answers with the same
+    generic body (an address that already has an account is indistinguishable
+    from a fresh one). The mail is sent after the response; the account is
+    created when its link is opened (`POST /auth/verify-email`). See
+    `auth_service.signup`.
     """
-    return await auth_service.signup(session, data)
+    delivery = await auth_service.signup(session, data)
+    if delivery is not None:
+        background_tasks.add_task(email_verification.deliver_verification_email, delivery)
+    return VerificationRequested()
+
+
+@router.post(
+    "/verify-email",
+    response_model=VerifyEmailResponse,
+    dependencies=[Depends(_VERIFY_EMAIL_RATE_LIMIT)],
+)
+async def verify_email(data: VerifyEmailRequest, session: DbSession) -> VerifyEmailResponse:
+    """Consume a verification token and complete what it was issued for.
+    POST (not GET) so mail-scanner link prefetching cannot consume it; returns
+    no tokens -- the user signs in normally afterwards."""
+    await email_verification.verify_token(session, data.token)
+    return VerifyEmailResponse()
+
+
+@router.post(
+    "/email-verification/resend",
+    response_model=VerificationRequested,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(_RESEND_RATE_LIMIT), Depends(require_email_delivery)],
+)
+async def resend_verification(
+    data: ResendVerificationRequest, session: DbSession, background_tasks: BackgroundTasks
+) -> VerificationRequested:
+    """Resend whatever verification is outstanding for an address. Always the
+    same 202 body, whether or not anything was sent."""
+    delivery = await email_verification.resend_verification(session, email=data.email)
+    if delivery is not None:
+        background_tasks.add_task(email_verification.deliver_verification_email, delivery)
+    return VerificationRequested()
 
 
 @router.post("/login", response_model=LoginResponse, dependencies=[Depends(_LOGIN_RATE_LIMIT)])

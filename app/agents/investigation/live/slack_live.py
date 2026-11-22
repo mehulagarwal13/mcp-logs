@@ -30,7 +30,8 @@ from typing import Any
 
 import httpx
 
-from app.core.tenancy.schemas import ConnectorConfig
+from app.agents.investigation.live.base import LiveSourceAuthError, LiveSourceError
+from app.core.tenancy.live_credentials import LiveConnectorCredential
 from app.shared.config.logging import get_logger
 from app.shared.schemas import EvidenceItem
 
@@ -41,6 +42,10 @@ _MAX_CHANNELS_PER_CALL = 5  # bounds latency/rate-limit usage per lookup
 _HISTORY_PAGE_SIZE = 100
 _SUMMARY_MAX_CHARS = 300
 _MIN_KEYWORD_LENGTH = 3  # skip short/common words ("is", "to", ...) as filter terms
+# Slack reports credential problems as HTTP 200 with `{"ok": false, "error": ...}`.
+_SLACK_AUTH_ERRORS = frozenset(
+    {"invalid_auth", "not_authed", "token_revoked", "token_expired", "account_inactive"}
+)
 
 
 class SlackLiveSource:
@@ -56,28 +61,36 @@ class SlackLiveSource:
     async def fetch_live_evidence(
         self,
         *,
-        connector_config: ConnectorConfig,
+        connector: LiveConnectorCredential,
         query: str,
         since: datetime,
         limit: int,
     ) -> list[EvidenceItem]:
-        channels: list[str] = list(connector_config.config.get("channels", []))[
+        channels: list[str] = list(connector.config.get("channels", []))[
             :_MAX_CHANNELS_PER_CALL
         ]
         if not channels:
             return []
 
         keywords = [word.lower() for word in query.split() if len(word) >= _MIN_KEYWORD_LENGTH]
-        headers = {"Authorization": f"Bearer {connector_config.credential_ref}"}
+        headers = {"Authorization": f"Bearer {connector.reveal_token()}"}
 
         evidence: list[EvidenceItem] = []
+        failed = 0
         async with httpx.AsyncClient(
             base_url=_SLACK_API_BASE_URL, headers=headers, timeout=15.0
         ) as http:
             for channel_id in channels:
-                evidence.extend(
-                    await self._fetch_channel_matches(http, channel_id, since, keywords)
-                )
+                found = await self._fetch_channel_matches(http, channel_id, since, keywords)
+                if found is None:
+                    failed += 1
+                else:
+                    evidence.extend(found)
+
+        if failed == len(channels):
+            # Every channel failed (an auth failure raises earlier): do not
+            # report this as "nothing relevant found".
+            raise LiveSourceError("all Slack live requests failed")
 
         evidence.sort(key=lambda item: item.source_timestamp or since, reverse=True)
         return evidence[:limit]
@@ -88,7 +101,7 @@ class SlackLiveSource:
         channel_id: str,
         since: datetime,
         keywords: list[str],
-    ) -> list[EvidenceItem]:
+    ) -> list[EvidenceItem] | None:
         try:
             response = await http.get(
                 "conversations.history",
@@ -101,15 +114,27 @@ class SlackLiveSource:
             response.raise_for_status()
             payload = response.json()
             if not payload.get("ok", False):
+                slack_error = payload.get("error")
+                if slack_error in _SLACK_AUTH_ERRORS:
+                    raise LiveSourceAuthError("Slack rejected the connector credential")
                 logger.warning(
-                    "slack_live_fetch_failed",
-                    channel_id=channel_id,
-                    slack_error=payload.get("error"),
+                    "slack_live_fetch_failed", channel_id=channel_id, slack_error=slack_error
                 )
-                return []
+                return None
+        except LiveSourceAuthError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 401:
+                raise LiveSourceAuthError("Slack rejected the connector credential") from None
+            logger.warning(
+                "slack_live_fetch_failed",
+                channel_id=channel_id,
+                status=exc.response.status_code,
+            )
+            return None
         except Exception as exc:
             logger.warning("slack_live_fetch_failed", channel_id=channel_id, error=str(exc))
-            return []
+            return None
 
         messages: list[dict[str, Any]] = payload.get("messages", [])
         matches = [message for message in messages if self._matches(message.get("text", ""), keywords)]

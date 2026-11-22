@@ -101,6 +101,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import PermissionDeniedError
+from app.mcp.oauth.constants import MCP_SCOPE
 from app.mcp.oauth.provider import EkipOAuthProvider, register_authorization_confirmation_route
 from app.shared.config.settings import get_settings
 
@@ -114,8 +115,12 @@ mcp_server = MCPServer(
         issuer_url=_public_base_url,
         resource_server_url=_public_base_url,
         client_registration_options=ClientRegistrationOptions(
-            enabled=True, valid_scopes=["ekip"], default_scopes=["ekip"]
+            enabled=True,
+            valid_scopes=[MCP_SCOPE],
+            default_scopes=[MCP_SCOPE],
+            client_secret_expiry_seconds=get_settings().mcp_oauth_client_secret_expiry_days * 86400,
         ),
+        required_scopes=[MCP_SCOPE],
         revocation_options=RevocationOptions(enabled=True),
     ),
 )

@@ -615,3 +615,57 @@ async def test_update_incident_reopening_clears_resolved_at(monkeypatch) -> None
     )
     assert update_kwargs["resolved_at"] is None
     assert set(changed_fields) == {"status", "resolved_at"}
+
+
+# --- record_investigation_result: live-evidence status is persisted ---------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_status", [True, False])
+async def test_record_investigation_result_persists_live_evidence_status(
+    monkeypatch, with_status: bool
+) -> None:
+    from types import SimpleNamespace
+
+    from app.shared.schemas import InvestigationResult, LiveEvidenceStatus, LiveSourceOutcome
+
+    organization_id = uuid.uuid4()
+    actor = Identity(
+        kind=ActorKind.USER,
+        subject=str(uuid.uuid4()),
+        organization_id=organization_id,
+        user_id=uuid.uuid4(),
+        permissions=frozenset({"incident:read"}),
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_get_owned_incident(session, org_id, incident_id):
+        return SimpleNamespace(id=incident_id, project_id=uuid.uuid4())
+
+    async def fake_insert_timeline_entry(session, **kwargs):
+        captured.update(kwargs)
+        now = datetime.now(timezone.utc)
+        return SimpleNamespace(id=uuid.uuid4(), occurred_at=now, **kwargs)
+
+    monkeypatch.setattr(incidents_service, "_get_owned_incident", fake_get_owned_incident)
+    monkeypatch.setattr(
+        incidents_service.repository, "insert_timeline_entry", fake_insert_timeline_entry
+    )
+    status = LiveEvidenceStatus(
+        status="partial",
+        sources=[LiveSourceOutcome(source="github", outcome="auth_failed", reason="auth_failed")],
+    )
+    investigation = InvestigationResult(
+        evidence=[],
+        hypotheses=[],
+        suggested_owner_team=None,
+        suggested_next_steps=[],
+        live_evidence=status if with_status else None,
+    )
+
+    await incidents_service.record_investigation_result(
+        None, actor, organization_id, uuid.uuid4(), investigation
+    )
+
+    event_data = captured["event_data"]
+    assert event_data["live_evidence"] == (status.model_dump(mode="json") if with_status else None)

@@ -1102,27 +1102,92 @@ async def _process_one_item(
             "Document exceeded ingestion_max_chunks_per_document."
         )
 
+    organization_id = resolved_config.organization_id
     existing = await repository.get_latest_document(
-        session, resolved_config.organization_id, processed.source, processed.external_id
+        session, organization_id, processed.source, processed.external_id
     )
     if existing is not None and existing.content_hash == processed.content_hash:
         return _ItemProcessingResult(0, 0)  # unchanged -- idempotent no-op
 
+    # Content changed (or first sight). From here on this item mutates the
+    # document's version chain, so serialize against every other writer of
+    # the same logical document -- the Redis per-connector lock fails open
+    # and does not cover two connector configs ingesting the same item.
+    # Transaction-scoped: released at the commit/rollback of this item. The
+    # unchanged fast path above deliberately takes no lock (it is the common
+    # case and holds the read transaction open across the page).
+    await repository.lock_document_key(
+        session, organization_id, processed.source, processed.external_id
+    )
+    # Double-checked: a concurrent writer may have finished while we waited
+    # for the lock, so what we read above may already be stale.
+    existing = await repository.get_latest_document(
+        session, organization_id, processed.source, processed.external_id
+    )
+    if existing is not None and existing.content_hash == processed.content_hash:
+        return _ItemProcessingResult(0, 0)  # someone else just ingested this exact content
+
     next_version = (existing.version + 1) if existing is not None else 1
-    document_row = await repository.insert_document(
+
+    # A -> B -> A revert: the old "A" row still exists (superseded) and holds
+    # the unique idempotency key, so inserting another "A" row would violate
+    # `uq_documents_org_source_external_hash`. Reuse that row instead of
+    # deleting history or relaxing the constraint: it becomes current again
+    # at the next version number, keeping its id (so citations to it resolve
+    # to the content they cited). A soft-deleted match is NOT revived -- a
+    # human/ops removal must not be silently undone; the insert below then
+    # fails on the unique constraint exactly as it did before this change.
+    matched = await repository.find_document_by_content_hash(
+        session, organization_id, processed.source, processed.external_id, processed.content_hash
+    )
+    if matched is not None and matched.deleted_at is None:
+        document_row = await repository.revive_document(
+            session,
+            matched,
+            version=next_version,
+            project_id=project_id,
+            title=processed.title,
+            source_url=processed.source_url,
+        )
+        await repository.replace_document_metadata(
+            session, document_id=document_row.id, entries=processed.metadata_entries
+        )
+        # Chunks of a revived row were normally purged when it was superseded,
+        # but a row superseded before cleanup existed may still have some;
+        # clear them so the upsert below leaves exactly the current chunk set.
+        await retrieval_service.delete_document(session, document_row.id)
+    else:
+        document_row = await repository.insert_document(
+            session,
+            organization_id=organization_id,
+            project_id=project_id,
+            source=processed.source,
+            external_id=processed.external_id,
+            content_hash=processed.content_hash,
+            title=processed.title,
+            source_url=processed.source_url,
+            version=next_version,
+        )
+        await repository.insert_document_metadata(
+            session, document_id=document_row.id, entries=processed.metadata_entries
+        )
+
+    # Supersede every other still-current version of this logical document and
+    # remove their now-stale chunks from ALL four chunk tables. Old
+    # `documents`/`document_metadata` rows are kept (citations by id keep
+    # resolving). All of this is inside the caller's `begin_nested()`
+    # savepoint together with the insert and the chunk upsert below: if
+    # embedding or any write fails, the supersession and the purge roll back
+    # with it and the previous version stays current and searchable.
+    superseded_ids = await repository.supersede_other_versions(
         session,
-        organization_id=resolved_config.organization_id,
-        project_id=project_id,
+        organization_id=organization_id,
         source=processed.source,
         external_id=processed.external_id,
-        content_hash=processed.content_hash,
-        title=processed.title,
-        source_url=processed.source_url,
-        version=next_version,
+        keep_document_id=document_row.id,
     )
-    await repository.insert_document_metadata(
-        session, document_id=document_row.id, entries=processed.metadata_entries
-    )
+    for superseded_id in superseded_ids:
+        await retrieval_service.delete_document(session, superseded_id)
 
     # processed.chunks are never persisted by ingestion itself --
     # `<collection>_chunks` tables are retrieval-owned (Chunk's docstring in

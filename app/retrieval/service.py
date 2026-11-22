@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import uuid
 from collections import defaultdict
+from typing import get_args
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -66,6 +67,7 @@ from app.retrieval.schemas import (
     ScoredChunk,
     SearchFilters,
     UpsertChunk,
+    validate_top_k,
 )
 
 # Every collection this milestone supports (`app.database.models.
@@ -92,6 +94,8 @@ async def search(
     Returns at most `top_k` chunks overall (not `top_k` per collection),
     ranked by fused RRF score descending.
     """
+    # Before the (expensive) embedding call: a bad `top_k` is a caller bug.
+    validate_top_k(top_k)
     collections_to_search = _ALL_COLLECTIONS if collection is None else (collection,)
 
     query_embedding = await embedding.embed_query(query)
@@ -157,6 +161,7 @@ async def search_with_signals(
     other caller (ingestion, the Investigation Agent's collection-scoped
     steps) still uses `search()`, not this function.
     """
+    validate_top_k(top_k)
     query_embedding = await embedding.embed_query(query)
     if collection is None:
         dense = await _store.search_all(session, query_embedding, filters, top_k)
@@ -202,3 +207,30 @@ async def upsert(session: AsyncSession, chunks: list[UpsertChunk]) -> None:
 async def delete(session: AsyncSession, collection: CollectionName, document_id: uuid.UUID) -> None:
     """Remove every chunk belonging to `document_id` from `collection`."""
     await _store.delete(session, collection, document_id)
+
+
+# EVERY chunk table, including "incidents" -- unlike `_ALL_COLLECTIONS` above,
+# which is the default *search* scope and deliberately excludes it. Derived
+# from the `CollectionName` Literal so a collection added there can never be
+# silently missed by a cleanup that sweeps "all" of them.
+_EVERY_CHUNK_COLLECTION: tuple[CollectionName, ...] = get_args(CollectionName)
+
+
+async def delete_document(session: AsyncSession, document_id: uuid.UUID) -> list[CollectionName]:
+    """Remove every chunk derived from `document_id` from ALL chunk
+    collections (documentation, code, conversations, incidents), returning
+    the collections swept.
+
+    Sweeps all four rather than the one a document was last classified into:
+    a changed document can be re-classified between versions, and a caller
+    cleaning up a superseded or rejected document should not need to know
+    where its chunks happened to land. Deleting from a collection with no
+    matching rows is a no-op, so this is idempotent.
+
+    Runs in the caller's session/transaction -- it never commits, so it is
+    atomic with whatever the caller is doing (e.g. ingestion's per-item
+    savepoint).
+    """
+    for collection in _EVERY_CHUNK_COLLECTION:
+        await delete(session, collection, document_id)
+    return list(_EVERY_CHUNK_COLLECTION)

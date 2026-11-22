@@ -15,11 +15,30 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.core.auth import email_verification
 from app.core.auth import service as auth_service
 from app.core.auth.schemas import RefreshRequest, SessionTokens
 from app.core.exceptions import ConflictError, NotFoundError, PermissionDeniedError
 from app.core.tenancy.schemas import InvitationAcceptRequest
+from app.core.users.schemas import UserEmailState
 from app.shared.security import hash_opaque_token
+
+
+def _email_state(*, verified: bool = True, active: bool = True, has_password: bool = True):
+    return UserEmailState(
+        user_id=uuid.uuid4(),
+        email="person@example.com",
+        email_verified_at=datetime.now(timezone.utc) if verified else None,
+        is_active=active,
+        has_password=has_password,
+    )
+
+
+def _patch_user_state(monkeypatch, state) -> None:
+    async def fake_state(session, user_id):
+        return state
+
+    monkeypatch.setattr(auth_service.users_service, "get_user_email_state_by_id", fake_state)
 
 
 class _FakeRefreshTokenRow:
@@ -30,6 +49,7 @@ class _FakeRefreshTokenRow:
         self.organization_id = organization_id
         self.family_id = uuid.uuid4()
         self.revoked_at = revoked_at
+        self.oauth_client_id = None
         self.expires_at = now + timedelta(days=30)
 
 
@@ -93,6 +113,7 @@ async def test_refresh_sets_tenant_context_before_reading_full_token_row(monkeyp
     )
     monkeypatch.setattr(auth_service.repository, "revoke_refresh_token", fake_revoke_refresh_token)
     monkeypatch.setattr(auth_service, "_issue_session", fake_issue_session)
+    _patch_user_state(monkeypatch, _email_state())
 
     result = await auth_service.refresh(None, RefreshRequest(refresh_token="a-valid-token"))
 
@@ -103,6 +124,82 @@ async def test_refresh_sets_tenant_context_before_reading_full_token_row(monkeyp
         "get_refresh_token_by_hash",
         "issue_session",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state_kwargs", "expected_code"),
+    [
+        ({"verified": False}, "auth.email_not_verified"),
+        ({"active": False}, "user.inactive"),
+        ({"verified": False, "active": False}, "user.inactive"),
+    ],
+)
+async def test_refresh_is_refused_for_unverified_or_inactive_user_and_does_not_rotate(
+    monkeypatch, state_kwargs, expected_code
+) -> None:
+    """A refresh token must not outlive the account state that made it
+    acceptable: a legacy/unverified or deactivated account gets no new
+    tokens, and the presented token is NOT rotated/revoked by the refusal."""
+    organization_id = uuid.uuid4()
+    token_row = _FakeRefreshTokenRow(organization_id=organization_id)
+    rotated: list[object] = []
+    issued: list[object] = []
+
+    async def fake_resolve(session, token_hash):
+        return organization_id
+
+    async def fake_set_tenant_context(session, org_id) -> None:
+        return None
+
+    async def fake_get_refresh_token_by_hash(session, token_hash):
+        return token_row
+
+    async def fake_revoke_refresh_token(session, refresh_token_id, *, revoked_at) -> None:
+        rotated.append(refresh_token_id)
+
+    async def fake_issue_session(session, **kwargs):
+        issued.append(kwargs)
+
+    monkeypatch.setattr(auth_service.repository, "resolve_refresh_token_organization_id", fake_resolve)
+    monkeypatch.setattr(auth_service, "set_tenant_context", fake_set_tenant_context)
+    monkeypatch.setattr(
+        auth_service.repository, "get_refresh_token_by_hash", fake_get_refresh_token_by_hash
+    )
+    monkeypatch.setattr(auth_service.repository, "revoke_refresh_token", fake_revoke_refresh_token)
+    monkeypatch.setattr(auth_service, "_issue_session", fake_issue_session)
+    _patch_user_state(monkeypatch, _email_state(**state_kwargs))
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await auth_service.refresh(None, RefreshRequest(refresh_token="a-valid-token"))
+
+    assert exc_info.value.error_code == expected_code
+    assert rotated == [] and issued == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_is_refused_when_the_user_row_is_gone(monkeypatch) -> None:
+    organization_id = uuid.uuid4()
+    token_row = _FakeRefreshTokenRow(organization_id=organization_id)
+
+    async def fake_resolve(session, token_hash):
+        return organization_id
+
+    async def fake_set_tenant_context(session, org_id) -> None:
+        return None
+
+    async def fake_get_refresh_token_by_hash(session, token_hash):
+        return token_row
+
+    monkeypatch.setattr(auth_service.repository, "resolve_refresh_token_organization_id", fake_resolve)
+    monkeypatch.setattr(auth_service, "set_tenant_context", fake_set_tenant_context)
+    monkeypatch.setattr(
+        auth_service.repository, "get_refresh_token_by_hash", fake_get_refresh_token_by_hash
+    )
+    _patch_user_state(monkeypatch, None)
+
+    with pytest.raises(PermissionDeniedError):
+        await auth_service.refresh(None, RefreshRequest(refresh_token="a-valid-token"))
 
 
 @pytest.mark.asyncio
@@ -221,50 +318,70 @@ class _FakeInvitationRow:
         self.grants_role_id = grants_role_id or uuid.uuid4()
 
 
+def _patch_invitation_org(monkeypatch, organization_id: uuid.UUID | None = None):
+    """The accept endpoint is unauthenticated: the invitation's organization is
+    resolved through the RLS-bypass function and tenant context is set BEFORE
+    the RLS-protected `invitations` read. Returns the recorded context calls."""
+    org = organization_id or uuid.uuid4()
+    context_calls: list[uuid.UUID] = []
+
+    async def fake_resolve(session, invitation_id):
+        return org
+
+    async def fake_set_tenant_context(session, org_id) -> None:
+        context_calls.append(org_id)
+
+    monkeypatch.setattr(auth_service.repository, "resolve_invitation_organization_id", fake_resolve)
+    monkeypatch.setattr(auth_service, "set_tenant_context", fake_set_tenant_context)
+    return context_calls
+
+
+def _patch_no_existing_account(monkeypatch, *, exists: bool = False) -> None:
+    async def fake_find(session, email):
+        return uuid.uuid4() if exists else None
+
+    monkeypatch.setattr(auth_service.users_service, "find_user_id_by_email_ci", fake_find)
+
+
 @pytest.mark.asyncio
-async def test_accept_invitation_with_password_provisions_user_and_issues_session(monkeypatch) -> None:
-    """The happy path: a valid, matching token provisions a real user
-    (`get_or_create_user` -> `set_password` -> `assign_role`), consumes the
-    invitation via the unchanged `tenancy_service.accept_invitation`, and
-    returns a real session -- the exact gap Phase 7.5 closes (previously
-    `accept_invitation` alone did none of this).
-    """
+async def test_accept_invitation_with_password_only_starts_verification_and_creates_nothing(
+    monkeypatch,
+) -> None:
+    """SECURITY: the invitation token is visible to the inviting admin, so it
+    is not proof of mailbox control. A valid token must therefore only record a
+    pending acceptance and hand back the mail to send -- no user, no password,
+    no role, no invitation consumption, no session."""
     organization_id = uuid.uuid4()
-    user_id = uuid.uuid4()
     invitation = _FakeInvitationRow(organization_id=organization_id)
-    call_order: list[str] = []
+    context_calls = _patch_invitation_org(monkeypatch, organization_id)
+    _patch_no_existing_account(monkeypatch)
+    forbidden: list[str] = []
+    started: dict[str, object] = {}
 
     async def fake_get_invitation_by_id(session, invitation_id):
+        assert context_calls == [organization_id], "tenant context must be set before the RLS read"
         assert invitation_id == invitation.id
         return invitation
 
-    async def fake_get_or_create_user(session, *, email, display_name):
-        call_order.append("get_or_create_user")
-        assert email == invitation.email
-        return user_id
+    async def fake_start(session, *, invitation_id, email, display_name, password_hash):
+        started.update(
+            invitation_id=invitation_id, email=email, display_name=display_name, password_hash=password_hash
+        )
+        return email_verification.PendingDelivery(uuid.uuid4(), "invitation", email, "raw-token")
 
-    async def fake_set_password(session, *, user_id: uuid.UUID, password_hash: str) -> None:
-        call_order.append("set_password")
+    def _forbid(name):
+        async def _inner(*args, **kwargs):
+            forbidden.append(name)
 
-    async def fake_assign_role(session, *, user_id, organization_id, role_id) -> None:
-        call_order.append("assign_role")
-        assert role_id == invitation.grants_role_id
-        assert organization_id == invitation.organization_id
-
-    async def fake_accept_invitation(session, invitation_id) -> None:
-        call_order.append("accept_invitation")
-        assert invitation_id == invitation.id
-
-    async def fake_issue_session(session, *, user_id, organization_id, family_id):
-        call_order.append("issue_session")
-        return SessionTokens(access_token="access-token", refresh_token="refresh-token", expires_in=900)
+        return _inner
 
     monkeypatch.setattr(auth_service.tenancy_repository, "get_invitation_by_id", fake_get_invitation_by_id)
-    monkeypatch.setattr(auth_service.users_service, "get_or_create_user", fake_get_or_create_user)
-    monkeypatch.setattr(auth_service.users_service, "set_password", fake_set_password)
-    monkeypatch.setattr(auth_service.users_service, "assign_role", fake_assign_role)
-    monkeypatch.setattr(auth_service.tenancy_service, "accept_invitation", fake_accept_invitation)
-    monkeypatch.setattr(auth_service, "_issue_session", fake_issue_session)
+    monkeypatch.setattr(auth_service.email_verification, "start_invitation_acceptance", fake_start)
+    monkeypatch.setattr(auth_service.users_service, "get_or_create_user", _forbid("get_or_create_user"))
+    monkeypatch.setattr(auth_service.users_service, "set_password", _forbid("set_password"))
+    monkeypatch.setattr(auth_service.users_service, "assign_role", _forbid("assign_role"))
+    monkeypatch.setattr(auth_service.tenancy_service, "accept_invitation", _forbid("accept_invitation"))
+    monkeypatch.setattr(auth_service, "_issue_session", _forbid("issue_session"))
 
     result = await auth_service.accept_invitation_with_password(
         None,
@@ -272,12 +389,72 @@ async def test_accept_invitation_with_password_provisions_user_and_issues_sessio
         InvitationAcceptRequest(token="correct-raw-token", password="a-strong-password"),
     )
 
-    assert result.access_token == "access-token"
-    assert call_order == ["get_or_create_user", "set_password", "assign_role", "accept_invitation", "issue_session"]
+    assert isinstance(result, email_verification.PendingDelivery)
+    assert forbidden == []
+    assert started["invitation_id"] == invitation.id
+    assert started["email"] == invitation.email
+    # only a bcrypt hash is carried forward, never the plaintext password
+    assert started["password_hash"] != "a-strong-password"
+    assert str(started["password_hash"]).startswith("$2")
+
+
+@pytest.mark.asyncio
+async def test_accept_invitation_with_password_refuses_to_adopt_an_existing_account(monkeypatch) -> None:
+    """SECURITY regression (account takeover): an existing account with the
+    invited email must NOT have its password overwritten or be issued a session
+    by whoever holds the (admin-visible) invitation token."""
+    invitation = _FakeInvitationRow(organization_id=uuid.uuid4())
+    _patch_invitation_org(monkeypatch, invitation.organization_id)
+    _patch_no_existing_account(monkeypatch, exists=True)
+    touched: list[str] = []
+
+    async def fake_get_invitation_by_id(session, invitation_id):
+        return invitation
+
+    async def fake_start(*args, **kwargs):
+        touched.append("start")
+
+    async def fake_set_password(*args, **kwargs):
+        touched.append("set_password")
+
+    async def fake_issue_session(*args, **kwargs):
+        touched.append("issue_session")
+
+    monkeypatch.setattr(auth_service.tenancy_repository, "get_invitation_by_id", fake_get_invitation_by_id)
+    monkeypatch.setattr(auth_service.email_verification, "start_invitation_acceptance", fake_start)
+    monkeypatch.setattr(auth_service.users_service, "set_password", fake_set_password)
+    monkeypatch.setattr(auth_service, "_issue_session", fake_issue_session)
+
+    with pytest.raises(ConflictError) as exc_info:
+        await auth_service.accept_invitation_with_password(
+            None,
+            invitation.id,
+            InvitationAcceptRequest(token="correct-raw-token", password="attacker-chosen-password"),
+        )
+
+    assert exc_info.value.error_code == "invitation.account_exists"
+    assert touched == []
+
+
+@pytest.mark.asyncio
+async def test_accept_invitation_with_password_rejects_invitation_with_no_resolvable_organization(
+    monkeypatch,
+) -> None:
+    async def fake_resolve(session, invitation_id):
+        return None
+
+    monkeypatch.setattr(auth_service.repository, "resolve_invitation_organization_id", fake_resolve)
+
+    with pytest.raises(NotFoundError):
+        await auth_service.accept_invitation_with_password(
+            None, uuid.uuid4(), InvitationAcceptRequest(token="whatever", password="a-strong-password")
+        )
 
 
 @pytest.mark.asyncio
 async def test_accept_invitation_with_password_rejects_unknown_invitation(monkeypatch) -> None:
+    _patch_invitation_org(monkeypatch)
+    _patch_no_existing_account(monkeypatch)
     async def fake_get_invitation_by_id(session, invitation_id):
         return None
 
@@ -291,6 +468,8 @@ async def test_accept_invitation_with_password_rejects_unknown_invitation(monkey
 
 @pytest.mark.asyncio
 async def test_accept_invitation_with_password_rejects_wrong_token(monkeypatch) -> None:
+    _patch_invitation_org(monkeypatch)
+    _patch_no_existing_account(monkeypatch)
     """A caller who merely learned the invitation id (previously sufficient
     to accept it) must not be able to accept without also proving control of
     the invited email address via the real token.
@@ -310,6 +489,8 @@ async def test_accept_invitation_with_password_rejects_wrong_token(monkeypatch) 
 
 @pytest.mark.asyncio
 async def test_accept_invitation_with_password_rejects_already_accepted_invitation(monkeypatch) -> None:
+    _patch_invitation_org(monkeypatch)
+    _patch_no_existing_account(monkeypatch)
     invitation = _FakeInvitationRow(organization_id=uuid.uuid4(), status="accepted")
 
     async def fake_get_invitation_by_id(session, invitation_id):
@@ -327,6 +508,8 @@ async def test_accept_invitation_with_password_rejects_already_accepted_invitati
 
 @pytest.mark.asyncio
 async def test_accept_invitation_with_password_rejects_expired_invitation(monkeypatch) -> None:
+    _patch_invitation_org(monkeypatch)
+    _patch_no_existing_account(monkeypatch)
     invitation = _FakeInvitationRow(
         organization_id=uuid.uuid4(),
         expires_at=datetime.now(timezone.utc) - timedelta(days=1),
@@ -347,6 +530,8 @@ async def test_accept_invitation_with_password_rejects_expired_invitation(monkey
 
 @pytest.mark.asyncio
 async def test_accept_invitation_with_password_rejects_revoked_invitation(monkeypatch) -> None:
+    _patch_invitation_org(monkeypatch)
+    _patch_no_existing_account(monkeypatch)
     invitation = _FakeInvitationRow(organization_id=uuid.uuid4(), status="revoked")
 
     async def fake_get_invitation_by_id(session, invitation_id):

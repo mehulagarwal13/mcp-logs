@@ -37,6 +37,21 @@ class User(Base):
     #: same generic way it rejects a wrong password (no user enumeration).
     password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    #: When EKIP obtained *evidence* that this person controls `email`
+    #: (a consumed email-verification link, an IdP that affirmatively
+    #: asserted a verified email, or an explicit operator attestation).
+    #: `NULL` means "ownership not established": the account cannot
+    #: authenticate (`core.users.service.resolve_identity`, login, refresh
+    #: all refuse it). Pre-existing rows deliberately stay `NULL` -- nothing
+    #: they did before verification existed is defensible evidence of
+    #: mailbox ownership -- see docs/security/email-verification-*.md.
+    email_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: How `email_verified_at` was established:
+    #: `email_link | oidc | operator_attestation`. Provenance only; never a
+    #: substitute for checking `email_verified_at` itself.
+    email_verified_via: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -25,7 +25,7 @@ from __future__ import annotations
 import uuid
 
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import func, literal, or_, select, union_all
+from sqlalchemy import func, literal, literal_column, or_, select, text, union_all
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,7 +36,14 @@ from app.database.models.retrieval_models import (
     DocumentationChunk,
     IncidentChunk,
 )
-from app.retrieval.schemas import CollectionName, ScoredChunk, SearchFilters, UpsertChunk
+from app.retrieval.pgvector import telemetry
+from app.retrieval.schemas import (
+    CollectionName,
+    ScoredChunk,
+    SearchFilters,
+    UpsertChunk,
+    validate_top_k,
+)
 
 # Backs `search_all`/`lexical_search_all` (the "search every collection"
 # fast path `retrieval.service.search(collection=None)` uses) -- these three
@@ -68,6 +75,59 @@ _SINGLE_COLLECTION_MODELS: dict[CollectionName, type] = {
 
 
 _REPO_SCOPED_COLLECTIONS: frozenset[CollectionName] = frozenset({"code", "documentation"})
+
+# --- HNSW search settings ----------------------------------------------------
+#
+# The chunk tables carry HNSW indexes (migration `b7c1d9e4f2a3`). Every EKIP
+# vector query is tenant-filtered, and an HNSW scan applies such filters AFTER
+# it has fetched its candidate list, so without these settings a filtered query
+# can return fewer rows than exist (verified by experiment). All three are
+# `set_config(..., is_local => true)`: transaction-scoped, so they die with the
+# caller's transaction exactly as `set_tenant_context`'s GUC does, and cannot
+# leak across pooled connections. They are issued on the CALLER's session, i.e.
+# in the same transaction as the tenant context and the vector query.
+#
+# - `plan_cache_mode = force_custom_plan`: asyncpg prepares every statement,
+#   and after a few executions PostgreSQL may switch to a *generic* plan that
+#   cannot see which tenant is being served; it then picks the HNSW scan even
+#   for tiny tenants, which is both slow and incomplete (measured: 700-1000 ms
+#   and short results). A custom plan per execution lets the planner use the
+#   tenant-specific statistics and choose the btree path for small tenants.
+# - `hnsw.iterative_scan = strict_order`: keep scanning until `LIMIT` rows
+#   that pass the filters are found, and return them in exact distance order
+#   (`relaxed_order` can return rows out of order, which would break the
+#   "dense[0] is the best hit" assumption in `retrieval.service`).
+#   pgvector >= 0.8.0 only: on older versions this setting either does nothing
+#   or raises "reserved prefix" depending on whether the connection has already
+#   loaded the library, so it is applied conditionally *inside the SQL* (CASE
+#   short-circuits), never by try/except on a failed statement.
+# - `hnsw.ef_search = 100`: the candidate-list size; 100 measurably improved
+#   recall over the default 40 at similar latency.
+_VECTOR_SEARCH_EF_SEARCH = 100
+# True when the installed pgvector is >= 0.8.0 (the release that introduced
+# iterative index scans). Compared as integer arrays, so 0.10.x > 0.8.x.
+_PGVECTOR_AT_LEAST_0_8 = (
+    "string_to_array(regexp_replace(extversion, '[^0-9.].*$', ''), '.')::int[] >= ARRAY[0, 8, 0]"
+)
+_VECTOR_SEARCH_SETTINGS_SQL = text(
+    "SELECT set_config('plan_cache_mode', 'force_custom_plan', true), "
+    "set_config('hnsw.ef_search', :ef_search, true), "
+    f"CASE WHEN (SELECT {_PGVECTOR_AT_LEAST_0_8} FROM pg_extension WHERE extname = 'vector') "
+    "THEN set_config('hnsw.iterative_scan', 'strict_order', true) END"
+)
+
+
+async def _apply_vector_search_settings(session: AsyncSession) -> None:
+    await session.execute(
+        _VECTOR_SEARCH_SETTINGS_SQL, {"ef_search": str(_VECTOR_SEARCH_EF_SEARCH)}
+    )
+
+
+def _exact_order(distance):
+    """`distance + 0` is a different expression from the one the HNSW index
+    orders by, so the planner cannot use the index for it: used only for the
+    exact fallback below, which must be an exhaustive search."""
+    return distance + literal_column("0")
 
 
 def _repository_filter_clause(collection: CollectionName, model: type, repository: str):
@@ -125,8 +185,10 @@ class PgVectorStore:
         `ScoredChunk.metadata`'s docstring for why this isn't joined
         unconditionally.
         """
+        validate_top_k(top_k)
         model = _SINGLE_COLLECTION_MODELS[collection]
         distance = model.embedding.max_inner_product(query_embedding)
+        await _apply_vector_search_settings(session)
 
         stmt = (
             select(
@@ -152,6 +214,12 @@ class PgVectorStore:
             # the single chokepoint every retrieval path goes through, and
             # a filter the caller could forget is not a guarantee.
             .where(Document.deleted_at.is_(None))
+            # Only the current version of a document is searchable: a
+            # superseded version's chunks are removed at supersession, and
+            # this predicate keeps any not-yet-purged ones (older rows,
+            # an in-progress backfill) out of results. Same reasoning, and
+            # same need to repeat it in every query below, as `deleted_at`.
+            .where(Document.superseded_at.is_(None))
             .where(
                 or_(
                     model.acl_permission_code.is_(None),
@@ -164,10 +232,29 @@ class PgVectorStore:
         if filters.repository is not None:
             stmt = stmt.where(_repository_filter_clause(collection, model, filters.repository))
 
-        stmt = stmt.order_by(distance.asc()).limit(top_k)
-
-        result = await session.execute(stmt)
-        rows = result.all()
+        rows = (await session.execute(stmt.order_by(distance.asc()).limit(top_k))).all()
+        telemetry.record_dense_search(path="search", collection=collection)
+        if len(rows) < top_k:
+            # An approximate (HNSW) scan can come up short of what the filters
+            # actually permit; fewer than `top_k` rows is also the normal result
+            # for a small tenant. Either way an exact search is correct, and
+            # cheap exactly when this triggers. Completeness is not negotiable.
+            # Counted and logged (`telemetry`) so that "approximate pass
+            # under-retrieved" is distinguishable from "tenant is just small".
+            approximate_rows = len(rows)
+            rows = (
+                await session.execute(stmt.order_by(_exact_order(distance).asc()).limit(top_k))
+            ).all()
+            telemetry.record_exact_fallback(
+                path="search",
+                collection=collection,
+                top_k=top_k,
+                approximate_rows=approximate_rows,
+                exact_rows=len(rows),
+                organization_id=str(filters.organization_id),
+                has_project_filter=filters.project_ids is not None,
+                has_repository_filter=filters.repository is not None,
+            )
         metadata_by_document = await self._load_metadata_by_document(
             session, [row.document_id for row in rows] if include_metadata else []
         )
@@ -187,14 +274,10 @@ class PgVectorStore:
             for row in rows
         ]
 
-    async def search_all(
-        self,
-        session: AsyncSession,
-        query_embedding: list[float],
-        filters: SearchFilters,
-        top_k: int,
-    ) -> list[ScoredChunk]:
-        """Dense-search all collections in one database round-trip."""
+    @staticmethod
+    def _dense_all_statement(
+        query_embedding: list[float], filters: SearchFilters, top_k: int, *, exact: bool
+    ):
         branches = []
         for collection, model in _COLLECTION_MODELS.items():
             distance = model.embedding.max_inner_product(query_embedding)
@@ -213,6 +296,7 @@ class PgVectorStore:
                 .join(Document, Document.id == model.document_id)
                 .where(model.organization_id == filters.organization_id)
                 .where(Document.deleted_at.is_(None))
+                .where(Document.superseded_at.is_(None))
                 .where(
                     or_(
                         model.acl_permission_code.is_(None),
@@ -224,11 +308,55 @@ class PgVectorStore:
                 stmt = stmt.where(model.project_id.in_(filters.project_ids))
             if filters.repository is not None:
                 stmt = stmt.where(_repository_filter_clause(collection, model, filters.repository))
-            branches.append(stmt)
+            order = _exact_order(distance) if exact else distance
+            branches.append(stmt.order_by(order.asc()).limit(top_k))
         combined = union_all(*branches).subquery()
-        rows = (
-            await session.execute(select(combined).order_by(combined.c.distance.asc()).limit(top_k))
-        ).all()
+        return select(combined).order_by(combined.c.distance.asc()).limit(top_k)
+
+    async def search_all(
+        self,
+        session: AsyncSession,
+        query_embedding: list[float],
+        filters: SearchFilters,
+        top_k: int,
+    ) -> list[ScoredChunk]:
+        """Dense-search all collections in one database round-trip.
+
+        Each `UNION ALL` branch carries its OWN `ORDER BY distance LIMIT
+        top_k`, followed by the global `ORDER BY distance LIMIT top_k`. For an
+        exact scan this returns exactly what an unlimited union would (every
+        member of the global top-k is, by definition, in its own branch's
+        top-k), but it lets each branch use its collection's HNSW index: with
+        the limit only on the outer query PostgreSQL cannot push the ordering
+        into the branches and falls back to scanning every row of the tenant
+        (verified by `EXPLAIN`). Every filter is unchanged and repeated in each
+        branch, never applied to already-fetched rows.
+
+        If the (approximate) result is short of `top_k` rows, the identical
+        query is re-run in a form the planner cannot serve from an HNSW index,
+        i.e. exact -- see `_exact_order`.
+        """
+        validate_top_k(top_k)
+        # Built (and validated -- an unsupported repository filter raises here)
+        # before any statement is sent.
+        approximate = self._dense_all_statement(query_embedding, filters, top_k, exact=False)
+        await _apply_vector_search_settings(session)
+        rows = (await session.execute(approximate)).all()
+        telemetry.record_dense_search(path="search_all", collection="all")
+        if len(rows) < top_k:
+            approximate_rows = len(rows)
+            exact = self._dense_all_statement(query_embedding, filters, top_k, exact=True)
+            rows = (await session.execute(exact)).all()
+            telemetry.record_exact_fallback(
+                path="search_all",
+                collection="all",
+                top_k=top_k,
+                approximate_rows=approximate_rows,
+                exact_rows=len(rows),
+                organization_id=str(filters.organization_id),
+                has_project_filter=filters.project_ids is not None,
+                has_repository_filter=filters.repository is not None,
+            )
         return [
             ScoredChunk(
                 chunk_id=row.id,
@@ -252,6 +380,7 @@ class PgVectorStore:
         top_k: int,
     ) -> list[ScoredChunk]:
         """Lexically search all collections in one database round-trip."""
+        validate_top_k(top_k)
         branches = []
         for collection, model in _COLLECTION_MODELS.items():
             tsquery = func.websearch_to_tsquery("english", query_text)
@@ -272,6 +401,7 @@ class PgVectorStore:
                 .where(model.content_tsv.op("@@")(tsquery))
                 .where(model.organization_id == filters.organization_id)
                 .where(Document.deleted_at.is_(None))
+                .where(Document.superseded_at.is_(None))
                 .where(
                     or_(
                         model.acl_permission_code.is_(None),
@@ -324,6 +454,7 @@ class PgVectorStore:
 
         `include_metadata` -- see `search()`'s docstring, same contract.
         """
+        validate_top_k(top_k)
         model = _SINGLE_COLLECTION_MODELS[collection]
         tsquery = func.plainto_tsquery("english", query_text)
         rank = func.ts_rank_cd(model.content_tsv, tsquery).label("rank")
@@ -347,6 +478,7 @@ class PgVectorStore:
             # independently: fusing a filtered dense list with an
             # unfiltered lexical one would reintroduce the exact leak.
             .where(Document.deleted_at.is_(None))
+            .where(Document.superseded_at.is_(None))
             .where(
                 or_(
                     model.acl_permission_code.is_(None),

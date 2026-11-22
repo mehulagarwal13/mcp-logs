@@ -7,6 +7,9 @@ encrypt/decrypt step around `client_secret_encrypted`).
 
 from __future__ import annotations
 
+from datetime import datetime
+
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +18,13 @@ from app.database.models.mcp_models import OAuthClient
 
 async def get_oauth_client(session: AsyncSession, client_id: str) -> OAuthClient | None:
     return await session.get(OAuthClient, client_id)
+
+
+async def count_oauth_clients_created_since(session: AsyncSession, since: datetime) -> int:
+    result = await session.execute(
+        select(func.count()).select_from(OAuthClient).where(OAuthClient.created_at >= since)
+    )
+    return int(result.scalar_one())
 
 
 async def upsert_oauth_client(

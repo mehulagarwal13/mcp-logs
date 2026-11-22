@@ -9,7 +9,7 @@ connected services' credentials secure.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +23,11 @@ from app.core.exceptions import (
     ValidationError,
 )
 from app.core.tenancy import repository
+from app.core.tenancy.live_credentials import (
+    LiveConnectorCredential,
+    LiveConnectorResolution,
+    LiveConnectorSkip,
+)
 from app.core.tenancy.schemas import (
     AccessRule,
     AccessRuleCreate,
@@ -47,6 +52,7 @@ from app.shared.config.logging import get_logger
 from app.shared.schemas import Identity
 from app.shared.security import (
     KmsUnavailableError,
+    decrypt_secret,
     encrypt_secret,
     generate_opaque_token,
     get_kms,
@@ -56,6 +62,7 @@ from app.shared.security import (
 logger = get_logger(__name__)
 
 _MANAGE_PERMISSION = "tenancy:manage"
+_INCIDENT_READ_PERMISSION = "incident:read"
 # Same permission as `agents.service.get_agent_execution_stats`/`core.
 # observability.service.get_mcp_dashboard` -- an aggregate health dashboard
 # is an observability concern, not connector configuration, so it reuses
@@ -157,17 +164,29 @@ async def create_organization(
     org_row = await repository.insert_organization(
         session, name=data.name, slug=data.slug
     )
-    # enforces `app.current_organization_id`
-    # on every tenant-owned table, `projects` included -- the default
-    # project's INSERT below fails under RLS unless the tenant context is
-    # set first. There is no actor/Identity yet to have set it already (see
-    # this function's own docstring), so it must be set here, using the
-    # organization row just created above, before that insert.
-    await set_tenant_context(session, org_row.id)
-    await repository.insert_project(
-        session, organization_id=org_row.id, name="General", is_default=True
-    )
 
+    # Tenant-context ordering matters here (verified against real Postgres
+    # RLS as `ekip_app`): `app.current_organization_id` is a per-transaction
+    # setting, and every tenant-owned table's policy requires a written row's
+    # `organization_id` to match it.
+    #
+    #   1. The audit row belongs to the CALLER's organization
+    #      (`actor.organization_id`), so it must be written while the
+    #      caller's own context -- set per request by
+    #      `api.deps.get_current_identity` -- is still active. Writing it
+    #      after the switch below was rejected by the `audit_logs` policy
+    #      (the row's organization != the new organization's context), which
+    #      made `POST /organizations` fail and roll back entirely.
+    #   2. Only then switch to the NEW organization to insert its default
+    #      project (`projects` is RLS-protected too). For an unauthenticated
+    #      caller (signup / SSO) there is no actor and no prior context, so
+    #      this is the first and only context set.
+    #   3. Restore the caller's context so the rest of an authenticated
+    #      request does not silently keep running scoped to the new
+    #      organization. With no actor there is nothing to restore: the new
+    #      organization's context is left set, which signup relies on for its
+    #      follow-up writes (and sets explicitly -- see `core.auth.service.
+    #      signup`).
     if actor is not None:
         await record_audit_event(
             session,
@@ -177,6 +196,14 @@ async def create_organization(
             resource_id=org_row.id,
             metadata={"slug": org_row.slug},
         )
+
+    await set_tenant_context(session, org_row.id)
+    await repository.insert_project(
+        session, organization_id=org_row.id, name="General", is_default=True
+    )
+
+    if actor is not None:
+        await set_tenant_context(session, actor.organization_id)
 
     logger.info(
         "organization_created", organization_id=str(org_row.id), slug=org_row.slug
@@ -611,6 +638,120 @@ async def get_connector_by_source(
     if row is None:
         return None
     return ConnectorConfig.model_validate(row)
+
+
+async def resolve_live_evidence_connectors(
+    session: AsyncSession,
+    actor: Identity,
+    organization_id: uuid.UUID,
+    *,
+    incident_organization_id: uuid.UUID,
+    incident_project_id: uuid.UUID,
+    sources: Collection[str],
+    not_implemented_sources: Collection[str] = (),
+) -> LiveConnectorResolution:
+    """Internal read for the Investigation Agent's live lookups: the
+    organization's active connectors for `sources`, with credentials
+    decrypted in memory.
+
+    This is deliberately a different operation from `list_connectors`:
+    `list_connectors` is the *management* view (needs `tenancy:manage`,
+    always redacted, safe for the API). This function is for *using* a
+    connector on behalf of an investigation, so it is gated on the right to
+    read the incident being investigated (`incident:read` on its project)
+    rather than on `tenancy:manage`. It must never be exposed through a
+    router or MCP tool, and its result must never be returned or stored.
+
+    Enforced here (not merely trusted from the caller):
+      - same-organization guard on `organization_id` and on the incident;
+      - `incident:read` for `actor` on `incident_project_id`;
+      - only `status == "active"` connectors whose `source` is in `sources`;
+      - only connectors that are org-wide (`project_id is None`) or scoped to
+        the incident's own project -- another project's token is never used.
+
+    Connectors whose `source` is in `not_implemented_sources` (placeholder
+    live sources with no real backend) get the same org/status/project
+    filtering but are reported as skipped with reason `"not_implemented"`
+    WITHOUT decrypting their credential -- a secret is never loaded for a
+    source that cannot use it.
+
+    A connector whose credential cannot be decrypted (corrupt/tampered
+    envelope, KMS unavailable) is skipped with a fixed-vocabulary reason and
+    never aborts the others. Raw exception text is never kept: it could echo
+    ciphertext details.
+    """
+    _ensure_same_organization(actor, organization_id)
+    if incident_organization_id != organization_id:
+        logger.warning(
+            "tenancy_live_connectors_cross_organization_denied",
+            actor=actor.audit_tag,
+            actor_organization_id=str(actor.organization_id),
+        )
+        raise PermissionDeniedError(
+            "Cannot access another organization's data.",
+            error_code="tenancy.cross_organization_denied",
+            detail={"organization_id": str(incident_organization_id)},
+        )
+    require_project_permission(actor, incident_project_id, _INCIDENT_READ_PERMISSION)
+
+    credentials: list[LiveConnectorCredential] = []
+    skipped: list[LiveConnectorSkip] = []
+    rows = await repository.list_connector_configs(session, organization_id)
+    for row in rows:
+        if row.organization_id != organization_id:
+            continue  # belt and braces on top of the org filter and RLS
+        if row.status != "active":
+            continue
+        if row.source not in sources and row.source not in not_implemented_sources:
+            continue
+        if row.project_id is not None and row.project_id != incident_project_id:
+            continue
+        if row.source in not_implemented_sources and row.source not in sources:
+            skipped.append(
+                LiveConnectorSkip(
+                    connector_config_id=row.id, source=row.source, reason="not_implemented"
+                )
+            )
+            continue
+
+        try:
+            token = await decrypt_secret(get_kms(), row.credential_ref)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: skip, never abort or leak
+            reason = "credential_unavailable"
+            if isinstance(exc, KmsUnavailableError):
+                reason = "kms_unavailable"
+            logger.warning(
+                "tenancy_live_connector_credential_unavailable",
+                connector_config_id=str(row.id),
+                source=row.source,
+                error_type=type(exc).__name__,
+            )
+            skipped.append(
+                LiveConnectorSkip(connector_config_id=row.id, source=row.source, reason=reason)
+            )
+            continue
+        if not token:
+            skipped.append(
+                LiveConnectorSkip(
+                    connector_config_id=row.id, source=row.source, reason="credential_unavailable"
+                )
+            )
+            continue
+
+        credentials.append(
+            LiveConnectorCredential(
+                connector_config_id=row.id,
+                organization_id=row.organization_id,
+                project_id=row.project_id,
+                source=row.source,
+                # Same rule as `_redact_credential`: underscore keys are
+                # reserved worker state (cursors) and never leave this module.
+                config={k: v for k, v in (row.config or {}).items() if not k.startswith("_")},
+                token=token,
+            )
+        )
+
+    return LiveConnectorResolution(credentials=credentials, skipped=skipped)
 
 
 async def list_ingestion_runs(

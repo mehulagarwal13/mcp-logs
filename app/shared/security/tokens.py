@@ -1,4 +1,5 @@
 """Opaque single-use token hashing (Phase 7.5/7.6).
+EKIP securely stores single-use tokens, such as organization invitation tokens.
 
 Owned by: shared/ -- genuinely cross-module: `core.tenancy.service.
 create_invitation` (a new random token, hashed at rest here) and

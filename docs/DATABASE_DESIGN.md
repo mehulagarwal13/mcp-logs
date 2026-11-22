@@ -235,7 +235,7 @@ Chunk-level tables exist per collection, following the same shape; documented on
 | source_offset_start | INTEGER | preserves source-anchored offsets for citation, per `ARCHITECTURE.md` §5 |
 | source_offset_end | INTEGER | |
 
-Index: HNSW or IVFFlat index on `embedding` (algorithm choice deferred — logged as an open item below), plus `(document_id, chunk_index)`.
+Index: **HNSW** on `embedding` — `USING hnsw (embedding vector_ip_ops) WITH (m = 16, ef_construction = 128)`, named `ix_<table>_embedding_hnsw`, on the four `<collection>_chunks` tables (migration `b7c1d9e4f2a3`; **requires pgvector ≥ 0.8.0**, built `CONCURRENTLY`), plus `(document_id, chunk_index)`. The operator class matches the query operator (`<#>`, negative inner product — embeddings are L2-normalized). Because every query is tenant-filtered, retrieval sets `hnsw.iterative_scan = strict_order`, `hnsw.ef_search = 100` and `plan_cache_mode = force_custom_plan` per transaction (`PgVectorStore`), `search_all` applies `ORDER BY distance LIMIT k` inside each `UNION ALL` branch so every branch can use its index, and a result shorter than `top_k` is re-run as an exact search. `agent_memories.embedding` deliberately has no ANN index.
 
 If a collection ever moves to **Qdrant** (per the target per-collection design in `ARCHITECTURE.md` §8 — not built today), the equivalent chunk record would live in Qdrant's payload instead of Postgres, with only `document_id`/`chunk_index` bookkeeping needed for citation lookups staying in Postgres, joined back to Qdrant by a shared chunk ID.
 
@@ -254,7 +254,7 @@ documents ──< <collection>_chunks
 
 ## Open items (to resolve when we reach the `database/` implementation phase)
 
-- pgvector index type (HNSW vs. IVFFlat) and its tuning parameters — deferred until real data volume is known.
+- ~~pgvector index type and its tuning parameters~~ — resolved: HNSW, `m = 16`, `ef_construction = 128` (see the chunk-table index note above). Re-measure recall on real data before changing them.
 - Embedding dimension `N` — depends on final embedding model choice (not yet pinned in `ENGINEERING_DECISIONS.md`).
 - Whether `agent_executions.input_summary` needs a retention/TTL policy for privacy/storage reasons.
 

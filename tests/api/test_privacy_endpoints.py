@@ -215,3 +215,121 @@ def test_no_delete_verb_endpoint_exists_for_users():
     assert ("/users/{user_id}", "DELETE") not in operations
     # The real deletion surface is a POST to an explicit sub-resource.
     assert ("/users/{user_id}/data-deletion", "POST") in operations
+
+
+# --- HTTP error mapping for the V1/V2 safeguards ------------------------------
+#
+# These run the REAL service through the REAL router and exception handler
+# (`app.api.errors.ekip_error_handler`); only the database-touching lookups are
+# stubbed. They pin the exact status code and `error_code` a client sees for
+# each refusal, on BOTH the dry-run (GET .../plan) and the executing
+# (POST .../data-deletion) endpoint.
+
+from app.core.privacy import service as privacy_service  # noqa: E402
+from app.core.users import service as users_service  # noqa: E402
+
+_ENDPOINTS = [
+    pytest.param("get", "/users/{target}/data-deletion/plan", id="plan"),
+    pytest.param("post", "/users/{target}/data-deletion", id="execute"),
+]
+
+
+@pytest.fixture()
+def world(monkeypatch):
+    """Stubs for the database-backed lookups the guards use."""
+    state = {"user_exists": True, "is_member": True, "admins": {uuid.uuid4(), uuid.uuid4()}}
+
+    async def user_exists(session, user_id):
+        return state["user_exists"]
+
+    async def is_member(session, user_id, organization_id):
+        return state["is_member"]
+
+    async def list_admins(session, organization_id, *, lock):
+        return set(state["admins"])
+
+    async def acquire(session, organization_id):
+        return None
+
+    monkeypatch.setattr(privacy_service.repository, "user_exists", user_exists)
+    monkeypatch.setattr(users_service.repository, "is_organization_member", is_member)
+    monkeypatch.setattr(users_service.repository, "list_org_admin_user_ids", list_admins)
+    monkeypatch.setattr(users_service.repository, "acquire_org_admin_lock", acquire)
+    return state
+
+
+def _call(test_client, method, template, target):
+    return getattr(test_client, method)(template.format(target=target))
+
+
+@pytest.mark.parametrize(("method", "template"), _ENDPOINTS)
+def test_self_deletion_returns_400_with_its_error_code(client, world, method, template):
+    test_client, actor = client
+    response = _call(test_client, method, template, actor.user_id)
+    assert response.status_code == 400
+    assert response.json()["error_code"] == "privacy.cannot_delete_self"
+
+
+@pytest.mark.parametrize(("method", "template"), _ENDPOINTS)
+def test_non_member_returns_404_with_its_error_code(client, world, method, template):
+    test_client, _actor_identity = client
+    world["is_member"] = False
+    response = _call(test_client, method, template, uuid.uuid4())
+    assert response.status_code == 404
+    assert response.json()["error_code"] == "privacy.user_not_found"
+
+
+@pytest.mark.parametrize(("method", "template"), _ENDPOINTS)
+def test_nonexistent_user_returns_the_same_404(client, world, method, template):
+    test_client, _actor_identity = client
+    world["user_exists"] = False
+    response = _call(test_client, method, template, uuid.uuid4())
+    assert response.status_code == 404
+    assert response.json()["error_code"] == "privacy.user_not_found"
+
+
+@pytest.mark.parametrize(("method", "template"), _ENDPOINTS)
+def test_non_member_and_nonexistent_user_responses_are_identical(
+    client, world, method, template
+):
+    """No existence oracle: for the SAME requested id, a user who exists in
+    another organization and a user who does not exist at all must produce
+    byte-identical status, headers-relevant body and error code."""
+    test_client, _actor_identity = client
+    target = uuid.uuid4()
+
+    world.update(user_exists=True, is_member=False)  # exists, but in another tenant
+    other_tenant = _call(test_client, method, template, target)
+
+    world.update(user_exists=False, is_member=False)  # does not exist anywhere
+    missing = _call(test_client, method, template, target)
+
+    assert other_tenant.status_code == missing.status_code == 404
+    assert other_tenant.json() == missing.json()
+
+
+@pytest.mark.parametrize(("method", "template"), _ENDPOINTS)
+def test_last_admin_returns_409_with_its_error_code(client, world, method, template):
+    test_client, _actor_identity = client
+    target = uuid.uuid4()
+    world["admins"] = {target}  # the target is the organization's only admin
+    response = _call(test_client, method, template, target)
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "org.last_admin"
+
+
+@pytest.mark.parametrize(("method", "template"), _ENDPOINTS)
+def test_an_admin_with_another_admin_remaining_is_not_refused_as_last_admin(
+    client, world, method, template
+):
+    """Control: the 409 above is caused by the last-admin rule, not by the
+    stubbing -- with a second admin present the guard lets the request through
+    (it then fails later on the un-stubbed database, which is not a 409)."""
+    test_client, _actor_identity = client
+    target = uuid.uuid4()
+    world["admins"] = {target, uuid.uuid4()}
+    try:
+        response = _call(test_client, method, template, target)
+        assert response.status_code != 409
+    except Exception:  # noqa: BLE001 -- un-stubbed DB access past the guards
+        pass

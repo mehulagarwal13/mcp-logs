@@ -5,6 +5,8 @@ import { useToast } from "@/context/ToastContext";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import type { OrganizationSummary } from "@/types/auth";
+import type { ApiError } from "@/types/common";
+import { ResendVerification } from "./ResendVerification";
 
 export function LoginPage() {
   const { login, selectOrganization } = useAuth();
@@ -24,6 +26,10 @@ export function LoginPage() {
     organizations: OrganizationSummary[];
   } | null>(null);
   const [selectingOrganizationId, setSelectingOrganizationId] = useState<string | null>(null);
+  // Set when the backend refused login with `auth.email_not_verified` (correct
+  // password, but the address was never confirmed). The refusal is the server's:
+  // no tokens were issued, and this screen only offers to resend the link.
+  const [unverifiedEmail, setUnverifiedEmail] = useState<string | null>(null);
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -38,7 +44,11 @@ export function LoginPage() {
         return;
       }
       navigate("/ask");
-    } catch {
+    } catch (err) {
+      if ((err as ApiError)?.errorCode === "auth.email_not_verified") {
+        setUnverifiedEmail(email.trim());
+        return;
+      }
       toast({
         variant: "error",
         title: "Sign in failed",
@@ -67,6 +77,26 @@ export function LoginPage() {
     } finally {
       setSelectingOrganizationId(null);
     }
+  }
+
+  if (unverifiedEmail) {
+    return (
+      <div className="glass-panel rounded-2xl px-6 py-6">
+        <h1 className="mb-1 text-center text-lg font-semibold text-ink">Confirm your email first</h1>
+        <p className="mb-5 text-center text-sm text-ink-muted">
+          Your password is correct, but <span className="font-medium text-ink">{unverifiedEmail}</span>{" "}
+          hasn&apos;t been confirmed yet. Open the link in the email we sent, or request a new one.
+        </p>
+        <ResendVerification email={unverifiedEmail} />
+        <button
+          type="button"
+          className="mt-4 block w-full text-center text-xs font-medium text-ink-subtle hover:text-ink"
+          onClick={() => setUnverifiedEmail(null)}
+        >
+          Back to sign in
+        </button>
+      </div>
+    );
   }
 
   if (pendingSelection) {

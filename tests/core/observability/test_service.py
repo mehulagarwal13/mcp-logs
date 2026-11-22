@@ -56,7 +56,10 @@ async def test_get_mcp_dashboard_maps_aggregate_rows(monkeypatch) -> None:
         ),
     ]
 
-    async def fake_get_mcp_tool_stats(session, *, since=None):
+    seen: dict = {}
+
+    async def fake_get_mcp_tool_stats(session, organization_id, *, since=None):
+        seen["organization_id"] = organization_id
         return rows
 
     monkeypatch.setattr(
@@ -65,6 +68,7 @@ async def test_get_mcp_dashboard_maps_aggregate_rows(monkeypatch) -> None:
 
     result = await observability_service.get_mcp_dashboard(None, actor)
 
+    assert seen["organization_id"] == actor.organization_id  # scoped to the caller's org
     assert len(result) == 2
     assert result[0].tool_name == "ask_question"
     assert result[0].request_count == 10

@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import { useToast } from "@/context/ToastContext";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import type { ApiError } from "@/types/common";
+import { CheckEmailPanel } from "./CheckEmailPanel";
 
 function slugify(value: string): string {
   return value
@@ -17,7 +18,6 @@ function slugify(value: string): string {
 export function SignupPage() {
   const { signup } = useAuth();
   const { toast } = useToast();
-  const navigate = useNavigate();
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -25,6 +25,10 @@ export function SignupPage() {
   const [organizationSlug, setOrganizationSlug] = useState("");
   const [slugTouched, setSlugTouched] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // Set only after the server accepted the request. Accepting signup creates NO
+  // account and NO session -- it just emails a confirmation link -- so the next
+  // screen is "check your email", never the app.
+  const [submittedEmail, setSubmittedEmail] = useState<string | null>(null);
 
   function handleOrganizationNameChange(value: string) {
     setOrganizationName(value);
@@ -42,14 +46,21 @@ export function SignupPage() {
         organizationName,
         organizationSlug: organizationSlug || slugify(organizationName),
       });
-      navigate("/ask");
+      setSubmittedEmail(email.trim());
     } catch (err) {
       const apiError = err as ApiError;
-      const message = apiError?.message || "Please check your details and try again.";
+      const message =
+        apiError?.errorCode === "email.not_configured"
+          ? "Sign-up is temporarily unavailable. Please try again later."
+          : apiError?.message || "Please check your details and try again.";
       toast({ variant: "error", title: "Sign up failed", description: message });
     } finally {
       setIsSubmitting(false);
     }
+  }
+
+  if (submittedEmail) {
+    return <CheckEmailPanel email={submittedEmail} purpose="create your account" />;
   }
 
   return (

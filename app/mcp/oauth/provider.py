@@ -101,9 +101,13 @@ STORAGE: REGISTERED CLIENTS ARE PERSISTENT; FLOWS/CODES ARE NOT
 
 from __future__ import annotations
 
+import hmac
+import html
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
@@ -115,6 +119,7 @@ from mcp.server.auth.provider import (
     AuthorizeError,
     OAuthAuthorizationServerProvider,
     RefreshToken,
+    RegistrationError,
     TokenError,
     construct_redirect_uri,
 )
@@ -125,7 +130,14 @@ from app.core.auth.schemas import RefreshRequest
 from app.core.exceptions import EKIPError
 from app.core.mcp_oauth import service as mcp_oauth_service
 from app.core.users import service as users_service
+from app.mcp.oauth.constants import (
+    MCP_SCOPE,
+    accepted_resource_indicators,
+    mcp_resource_identifier,
+)
+from app.mcp.oauth.redirect_policy import first_redirect_uri_violation
 from app.shared.config.logging import get_logger
+from app.shared.config.settings import get_settings
 
 logger = get_logger(__name__)
 
@@ -136,13 +148,46 @@ logger = get_logger(__name__)
 _FLOW_TTL_SECONDS = 600
 _CODE_TTL_SECONDS = 300
 
+#: Rolling window over which `mcp_oauth_registrations_per_day` is counted.
+_REGISTRATION_WINDOW_SECONDS = 24 * 3600
+
 
 @dataclass
 class _PendingFlow:
     client_id: str
     params: AuthorizationParams
+    client_name: str | None = None
     created_at: float = field(default_factory=time.monotonic)
     error: str | None = None
+    #: Browser binding for the consent form (see `_handle_confirmation_post`):
+    #: delivered as an HttpOnly cookie on the GET and echoed in a hidden field.
+    csrf_token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
+
+
+def _harden_page(response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+    response.headers["X-Frame-Options"] = "DENY"
+
+
+def _expired_page() -> Response:
+    response = HTMLResponse(
+        "<p>This authorization link has expired or was already used. "
+        "Return to Claude and try connecting again.</p>",
+        status_code=400,
+    )
+    _harden_page(response)
+    return response
+
+
+def _csrf_failed_page() -> Response:
+    response = HTMLResponse(
+        "<p>This request could not be verified as coming from the authorization page "
+        "you opened. Reload that page, or return to Claude and try connecting again.</p>",
+        status_code=403,
+    )
+    _harden_page(response)
+    return response
 
 
 class EkipOAuthProvider:
@@ -196,12 +241,45 @@ class EkipOAuthProvider:
             data = await mcp_oauth_service.get_registered_client(session, client_id)
         if data is None:
             return None
-        return OAuthClientInformationFull.model_validate(data)
+        client = OAuthClientInformationFull.model_validate(data)
+        # A client registered before the redirect-URI policy existed (or with a
+        # since-removed host) is treated as unknown: the SDK then answers with
+        # a direct error and never redirects anywhere.
+        if first_redirect_uri_violation(
+            client.redirect_uris or [], get_settings().mcp_oauth_allowed_redirect_hosts
+        ):
+            logger.warning("mcp_oauth_client_redirect_uri_not_allowed", client_id=client_id)
+            return None
+        return client
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        violation = first_redirect_uri_violation(
+            client_info.redirect_uris or [], get_settings().mcp_oauth_allowed_redirect_hosts
+        )
+        if violation:
+            logger.warning("mcp_oauth_registration_rejected", reason=violation)
+            raise RegistrationError(error="invalid_redirect_uri", error_description=violation)
         session_factory = self._session_factory()
+        capped = False
         async with session_factory() as session:
-            await mcp_oauth_service.register_oauth_client(session, client_info.model_dump(mode="json"))
+            recent = await mcp_oauth_service.count_recent_registrations(
+                session, within_seconds=_REGISTRATION_WINDOW_SECONDS
+            )
+            if recent >= get_settings().mcp_oauth_registrations_per_day:
+                capped = True
+                logger.warning("mcp_oauth_registration_cap_reached", recent=recent)
+            else:
+                await mcp_oauth_service.register_oauth_client(
+                    session, client_info.model_dump(mode="json")
+                )
+        if capped:
+            # Raised outside the `async with`: the SDK's `RegistrationError` is a
+            # frozen dataclass, and an exception propagating through the session
+            # context manager has its `__traceback__` assigned (FrozenInstanceError).
+            raise RegistrationError(
+                error="invalid_client_metadata",
+                error_description="Client registration is temporarily unavailable; retry later.",
+            )
         logger.info("mcp_oauth_client_registered", client_id=client_info.client_id)
 
     # -- /authorize ------------------------------------------------------------
@@ -212,8 +290,17 @@ class EkipOAuthProvider:
         a third-party IdP -- see module docstring for why there is no
         third-party IdP to redirect to yet.
         """
+        if params.resource is not None and params.resource not in accepted_resource_indicators():
+            # RFC 8707 section 2: a token can only be requested for a resource
+            # this server is. Refused here, before any flow or code exists.
+            raise AuthorizeError(
+                error="invalid_target",
+                error_description="The requested resource is not served by this authorization server.",
+            )
         flow_id = uuid.uuid4().hex
-        self._pending_flows[flow_id] = _PendingFlow(client_id=client.client_id, params=params)
+        self._pending_flows[flow_id] = _PendingFlow(
+            client_id=client.client_id, params=params, client_name=client.client_name
+        )
         return f"/ekip/oauth/authorize?flow_id={flow_id}"
 
     def _pop_expired(self) -> None:
@@ -242,21 +329,52 @@ class EkipOAuthProvider:
         for flow_id in expired:
             self._pending_flows.pop(flow_id, None)
 
+    @staticmethod
+    def _csrf_cookie_name(flow_id: str) -> str:
+        # One cookie per flow, so two authorizations open in one browser
+        # never overwrite each other's binding.
+        return f"ekip_oauth_csrf_{flow_id}"
+
     async def _render_confirmation_page(self, flow_id: str, flow: _PendingFlow) -> Response:
-        error_html = f'<p class="error">{flow.error}</p>' if flow.error else ""
-        return HTMLResponse(f"""<!doctype html>
+        # Every interpolated value is HTML-escaped: client name, redirect URI
+        # and the error text are all attacker- or exception-influenced.
+        esc = html.escape
+        redirect_uri = str(flow.params.redirect_uri)
+        redirect_host = urlsplit(redirect_uri).netloc or redirect_uri
+        scopes = " ".join(flow.params.scopes or [MCP_SCOPE])
+        client_name = flow.client_name or "an application that did not give a name"
+        error_html = f'<p class="error">{esc(flow.error)}</p>' if flow.error else ""
+        response = HTMLResponse(
+            f"""<!doctype html>
 <html><head><title>Authorize EKIP MCP access</title>
 <style>
-  body {{ font-family: -apple-system, Segoe UI, sans-serif; max-width: 32rem; margin: 4rem auto; color: #1e293b; }}
+  body {{ font-family: -apple-system, Segoe UI, sans-serif; max-width: 34rem; margin: 3rem auto;
+          color: #1e293b; padding: 0 1rem; }}
   h1 {{ font-size: 1.25rem; }}
+  dl {{ background: #f1f5f9; border-radius: 0.5rem; padding: 0.75rem 1rem; }}
+  dt {{ color: #64748b; font-size: 0.8rem; margin-top: 0.5rem; }}
+  dd {{ margin: 0; font-family: monospace; word-break: break-all; }}
+  dd.host {{ font-weight: 700; font-size: 1.05rem; }}
   p.hint {{ color: #64748b; font-size: 0.9rem; }}
+  p.warn {{ color: #92400e; font-size: 0.9rem; }}
   p.error {{ color: #b91c1c; font-weight: 600; }}
   textarea {{ width: 100%; height: 6rem; font-family: monospace; box-sizing: border-box; }}
-  button {{ margin-top: 1rem; padding: 0.5rem 1.25rem; background: #2563eb; color: white; border: none;
-            border-radius: 0.25rem; cursor: pointer; font-size: 1rem; }}
+  button {{ margin-top: 1rem; padding: 0.5rem 1.25rem; background: #2563eb; color: white;
+            border: none; border-radius: 0.25rem; cursor: pointer; font-size: 1rem; }}
 </style></head>
 <body>
   <h1>Authorize this client to use your EKIP identity</h1>
+  <dl>
+    <dt>Application requesting access</dt><dd>{esc(client_name)}</dd>
+    <dt>Client ID</dt><dd>{esc(flow.client_id)}</dd>
+    <dt>You will be sent back to</dt><dd class="host">{esc(redirect_host)}</dd>
+    <dt>Full redirect address</dt><dd>{esc(redirect_uri)}</dd>
+    <dt>Access requested</dt><dd>{esc(scopes)}</dd>
+  </dl>
+  <p class="warn">
+    Only continue if you started this connection yourself and recognise the
+    address above. Anyone who receives the access you grant can use EKIP as you.
+  </p>
   <p class="hint">
     Paste a valid EKIP access token to continue. Mint one with
     <code>python scripts/seed_test_organization.py</code> (development), or via a
@@ -266,23 +384,41 @@ class EkipOAuthProvider:
   </p>
   {error_html}
   <form method="post" action="/ekip/oauth/authorize">
-    <input type="hidden" name="flow_id" value="{flow_id}">
+    <input type="hidden" name="flow_id" value="{esc(flow_id)}">
+    <input type="hidden" name="csrf_token" value="{esc(flow.csrf_token)}">
     <textarea name="ekip_access_token" placeholder="eyJhbGciOi..." required></textarea>
     <button type="submit">Authorize</button>
   </form>
-</body></html>""")
+</body></html>"""
+        )
+        response.set_cookie(
+            self._csrf_cookie_name(flow_id),
+            flow.csrf_token,
+            max_age=_FLOW_TTL_SECONDS,
+            path="/ekip/oauth/authorize",
+            httponly=True,
+            samesite="lax",
+            secure=get_settings().mcp_public_base_url.lower().startswith("https://"),
+        )
+        _harden_page(response)
+        return response
 
     async def _handle_confirmation_get(self, request: Request) -> Response:
         self._pop_expired()
         flow_id = request.query_params.get("flow_id", "")
         flow = self._pending_flows.get(flow_id)
         if flow is None:
-            return HTMLResponse(
-                "<p>This authorization link has expired or was already used. "
-                "Return to Claude and try connecting again.</p>",
-                status_code=400,
-            )
+            return _expired_page()
         return await self._render_confirmation_page(flow_id, flow)
+
+    def _csrf_valid(self, request: Request, form, flow_id: str, flow: _PendingFlow) -> bool:
+        """The form value, the cookie, and the flow's own stored token must all
+        match (constant-time) -- i.e. this POST came from the browser that
+        loaded this flow's consent page."""
+        expected = flow.csrf_token.encode()
+        submitted = str(form.get("csrf_token", "")).encode()
+        cookie = request.cookies.get(self._csrf_cookie_name(flow_id), "").encode()
+        return hmac.compare_digest(submitted, expected) and hmac.compare_digest(cookie, expected)
 
     async def _handle_confirmation_post(self, request: Request) -> Response:
         form = await request.form()
@@ -303,14 +439,19 @@ class EkipOAuthProvider:
         # can ever claim the flow; every other one gets the same clean
         # "already used" response immediately, before doing any DB work.
         self._pop_expired()
-        flow = self._pending_flows.pop(flow_id, None)
+        # The browser binding is checked BEFORE the flow is consumed, so a
+        # forged or cross-site POST can neither succeed nor burn the victim's
+        # pending authorization. No `await` separates the lookup from the pop
+        # below, so only one concurrent submission can still claim the flow.
+        flow = self._pending_flows.get(flow_id)
         if flow is None:
-            return HTMLResponse(
-                "<p>This authorization link has expired or was already used. "
-                "Return to Claude and try connecting again.</p>",
-                status_code=400,
-            )
+            return _expired_page()
+        if not self._csrf_valid(request, form, flow_id, flow):
+            logger.warning("mcp_oauth_csrf_check_failed", client_id=flow.client_id)
+            return _csrf_failed_page()
+        self._pending_flows.pop(flow_id, None)
 
+        granted_scopes = flow.params.scopes or [MCP_SCOPE]
         try:
             claims = auth_service.verify_access_token(raw_token)
             session_factory = self._session_factory()
@@ -325,6 +466,10 @@ class EkipOAuthProvider:
                     user_id=identity.user_id,
                     organization_id=identity.organization_id,
                     family_id=uuid.uuid4(),
+                    scope=" ".join(granted_scopes),
+                    oauth_client_id=flow.client_id,
+                    audience=mcp_resource_identifier(),
+                    issuer=mcp_resource_identifier(),
                 )
         except EKIPError as exc:
             # An invalid token is a mistake the human can fix (wrong paste,
@@ -338,7 +483,7 @@ class EkipOAuthProvider:
         code = uuid.uuid4().hex + uuid.uuid4().hex  # >128 bits entropy, per RFC 6749 section 10.10
         self._auth_codes[code] = AuthorizationCode(
             code=code,
-            scopes=flow.params.scopes or [],
+            scopes=granted_scopes,
             expires_at=time.time() + _CODE_TTL_SECONDS,
             client_id=flow.client_id,
             code_challenge=flow.params.code_challenge,
@@ -385,6 +530,7 @@ class EkipOAuthProvider:
             access_token=tokens.access_token,
             token_type="Bearer",
             expires_in=tokens.expires_in,
+            scope=" ".join(authorization_code.scopes),
             refresh_token=tokens.refresh_token,
         )
 
@@ -396,12 +542,17 @@ class EkipOAuthProvider:
         session_factory = self._session_factory()
         async with session_factory() as session:
             row = await auth_service.peek_refresh_token(session, refresh_token)
-        if row is None:
+        # Only a token issued TO an OAuth client can be presented by one. Its
+        # `client_id` is the client it was issued to (not the presenter), so the
+        # SDK's own `refresh_token.client_id != request client_id` check, the
+        # revocation endpoint's ownership check, and `auth_service.refresh`'s
+        # binding check all agree that another client cannot use it.
+        if row is None or row.oauth_client_id is None:
             return None
         return RefreshToken(
             token=refresh_token,
-            client_id=client.client_id,
-            scopes=[],
+            client_id=row.oauth_client_id,
+            scopes=[MCP_SCOPE],
             expires_at=int(row.expires_at.timestamp()),
             subject=str(row.user_id),
         )
@@ -415,13 +566,21 @@ class EkipOAuthProvider:
         session_factory = self._session_factory()
         try:
             async with session_factory() as session:
-                tokens = await auth_service.refresh(session, RefreshRequest(refresh_token=refresh_token.token))
+                tokens = await auth_service.refresh(
+                    session,
+                    RefreshRequest(refresh_token=refresh_token.token),
+                    scope=" ".join(scopes or refresh_token.scopes),
+                    oauth_client_id=client.client_id,
+                    audience=mcp_resource_identifier(),
+                    issuer=mcp_resource_identifier(),
+                )
         except EKIPError as exc:
             raise TokenError(error="invalid_grant", error_description=exc.message) from exc
         return OAuthToken(
             access_token=tokens.access_token,
             token_type="Bearer",
             expires_in=tokens.expires_in,
+            scope=" ".join(scopes or refresh_token.scopes),
             refresh_token=tokens.refresh_token,
         )
 
@@ -439,16 +598,18 @@ class EkipOAuthProvider:
         request reaching tool dispatch unauthenticated.
         """
         try:
-            claims = auth_service.verify_access_token(token)
+            resource = mcp_resource_identifier()
+            claims = auth_service.verify_access_token(token, audience=resource, issuer=resource)
         except EKIPError:
             return None
         return AccessToken(
             token=token,
             client_id="ekip-resource",
-            scopes=[],
+            scopes=list(claims.scopes),
             expires_at=int(claims.expires_at.timestamp()),
+            resource=resource,
             subject=str(claims.user_id),
-            claims={"organization_id": str(claims.organization_id)},
+            claims={"organization_id": str(claims.organization_id), "iss": resource},
         )
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
@@ -456,7 +617,11 @@ class EkipOAuthProvider:
             return  # access tokens are short-lived JWTs; nothing stateful to revoke
         session_factory = self._session_factory()
         async with session_factory() as session:
-            await auth_service.logout(session, RefreshRequest(refresh_token=token.token))
+            await auth_service.logout(
+                session,
+                RefreshRequest(refresh_token=token.token),
+                oauth_client_id=token.client_id,
+            )
 
 
 def register_authorization_confirmation_route(mcp_server, provider: EkipOAuthProvider) -> None:

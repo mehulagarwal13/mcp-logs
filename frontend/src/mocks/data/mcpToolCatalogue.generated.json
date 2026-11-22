@@ -1,0 +1,244 @@
+[
+  {
+    "name": "ask_question",
+    "description": "Answer a question about this organization's incidents, runbooks, and\nengineering knowledge, grounded in EKIP's own ingested data (past\nincidents, GitHub/Confluence/Slack/Jira history, runbooks) -- not general\nknowledge. Use this whenever the user asks what happened in an incident,\nwhy something broke, how a system works, where something is documented,\nor how a past incident was resolved.\n\nRoutes internally to either a direct grounded answer or a full\ninvestigation, depending on EKIP's own confidence -- the caller does not\nneed to decide which.\n\nArgs:\n    query: The natural-language question to answer.\n    incident_id: Optional -- scope the answer to one specific incident\n        (its UUID) if the question is about a particular incident already\n        identified elsewhere in the conversation.\n\nReturns: `{query: str, incident_id?: str}` -> `AskResponse` (serialized).\n",
+    "parameters": [
+      {
+        "name": "query",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "incident_id",
+        "type": "string",
+        "required": false,
+        "description": "",
+        "default": null
+      }
+    ]
+  },
+  {
+    "name": "configure_sso",
+    "description": "`{provider: \"entra_id\"|\"okta\"|\"auth0\"|\"google_workspace\", issuer_url: str,\nclient_id: str, client_secret_ref: str, protocol?: \"oidc\"|\"saml\"}` ->\n`SSOConfiguration` (serialized). Requires `tenancy:manage`. An invalid\n`provider`/`protocol` value surfaces as a Pydantic validation error when\nbuilding the request schema, the same rough edge already disclosed for\n`search_recent_changes`'s `since` parsing -- see that tool's docstring.\n",
+    "parameters": [
+      {
+        "name": "provider",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "issuer_url",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "client_id",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "client_secret_ref",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "protocol",
+        "type": "string",
+        "required": false,
+        "description": "",
+        "default": "oidc"
+      }
+    ]
+  },
+  {
+    "name": "create_access_rule",
+    "description": "`{rule_type: \"domain\"|\"group\", value: str, grants_role: str, is_active?: bool}`\n-> `AccessRule` (serialized). `value` is a domain (e.g. `\"acme.com\"`) for\n`rule_type=\"domain\"`, or a group name for `rule_type=\"group\"`. Requires\n`tenancy:manage`.\n",
+    "parameters": [
+      {
+        "name": "rule_type",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "value",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "grants_role",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "is_active",
+        "type": "boolean",
+        "required": false,
+        "description": "",
+        "default": "true"
+      }
+    ]
+  },
+  {
+    "name": "create_invitation",
+    "description": "`{email: str, grants_role: str, expires_at?: str (ISO-8601)}` ->\n`Invitation` (serialized). Omitting `expires_at` uses `core.tenancy.\nservice`'s own default lifetime (14 days). Requires `tenancy:manage`.\n",
+    "parameters": [
+      {
+        "name": "email",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "grants_role",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "expires_at",
+        "type": "string",
+        "required": false,
+        "description": "",
+        "default": null
+      }
+    ]
+  },
+  {
+    "name": "create_project",
+    "description": "`{name: str, is_default?: bool}` -> `Project` (serialized), created\nwithin the caller's own organization. Requires `tenancy:manage`.\n",
+    "parameters": [
+      {
+        "name": "name",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "is_default",
+        "type": "boolean",
+        "required": false,
+        "description": "",
+        "default": "false"
+      }
+    ]
+  },
+  {
+    "name": "generate_postmortem",
+    "description": "`{incident_id: str}` -> `Postmortem` (serialized, `status=\"draft\"`).",
+    "parameters": [
+      {
+        "name": "incident_id",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      }
+    ]
+  },
+  {
+    "name": "investigate_incident",
+    "description": "Run a full root-cause investigation on one specific, already-known\nEKIP incident (given its UUID) -- gathering evidence (related code\nchanges, similar past incidents, relevant docs) and producing hypotheses,\nnot just a grounded answer. Use this instead of `ask_question` when the\nuser already has a specific incident ID in hand and wants a deep\ninvestigation rather than a quick answer.\n\nReturns: `{incident_id: str}` -> `AskResponse` (with `investigation`\npopulated).\n",
+    "parameters": [
+      {
+        "name": "incident_id",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      }
+    ]
+  },
+  {
+    "name": "propose_runbook_update",
+    "description": "`{title: str, content: str, source_incident_id?: str}` -> `Document`\n(serialized, `status=\"proposed\"`).\n",
+    "parameters": [
+      {
+        "name": "title",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "content",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "source_incident_id",
+        "type": "string",
+        "required": false,
+        "description": "",
+        "default": null
+      }
+    ]
+  },
+  {
+    "name": "search_recent_changes",
+    "description": "Find recently ingested code/config/doc changes (e.g. GitHub commits,\ndeploys, config edits) relevant to `query` -- use this to check \"what\nchanged recently that could explain this\" during an investigation,\noptionally narrowed to changes after a given time with `since`, or to\none GitHub repository (e.g. `\"owner/name\"`) with `repository`.\n\n`collection` is one of `\"code\"`/`\"documentation\"`/`\"conversations\"`\n(`retrieval.schemas.CollectionName`, typed as plain `str` here rather\nthan imported -- `app.mcp` may not import `app.retrieval` directly,\nper this project's import-linter contract; `agents_service.\nsearch_recent_changes` is what actually validates it, and what its\ndefault comes from -- omit this parameter to use it rather than\nduplicating the default here). Omitted (the default), it searches both\n`\"documentation\"` (GitHub commit messages, PR bodies, and issue bodies\n-- no file extension, so `app.ingestion.processors.chunking.\nclassify_content_type` stores them here, not in `\"code\"`) and `\"code\"`\n(the repo's actual changed source files) together, fused into one\nranked list -- \"recent changes\" means both a commit's own description\nand the file it touched. Pass `collection=\"code\"` or\n`collection=\"documentation\"` explicitly to restrict to just one of the\ntwo instead. `repository` is only usable with `collection` `\"code\"` or\n`\"documentation\"` (or omitted) -- `\"conversations\"` (chat) has no\nrepository concept.\n\nReturns: `{query: str, since?: str, repository?: str, collection?: str}`\n-> `list[ScoredChunk]` (serialized).\n\n`since`, if given, must be an ISO-8601 timestamp -- a malformed value\nraises a plain `ValueError`, which `run_mcp_tool`'s caller will surface\nas an unexpected (500-mapped) failure rather than a clean 400, a known,\nminor rough edge left as-is rather than adding a bespoke `EKIPError`\nsubclass for one MCP tool's input parsing.\n",
+    "parameters": [
+      {
+        "name": "query",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "since",
+        "type": "string",
+        "required": false,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "repository",
+        "type": "string",
+        "required": false,
+        "description": "",
+        "default": null
+      },
+      {
+        "name": "collection",
+        "type": "string",
+        "required": false,
+        "description": "",
+        "default": null
+      }
+    ]
+  },
+  {
+    "name": "search_similar_incidents",
+    "description": "Find past EKIP incidents whose symptoms resemble the given\ndescription, e.g. \"checkout returning 500 errors\" or \"payments API\ntiming out after deploy\". Use this to check whether something similar\nhas happened before, rather than `ask_question` when the user\nspecifically wants a list of comparable past incidents rather than a\nsynthesized answer.\n\nReturns: `{description: str}` -> `list[ScoredChunk]` (serialized).\n",
+    "parameters": [
+      {
+        "name": "description",
+        "type": "string",
+        "required": true,
+        "description": "",
+        "default": null
+      }
+    ]
+  }
+]

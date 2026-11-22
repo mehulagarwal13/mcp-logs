@@ -63,14 +63,15 @@ import hashlib
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 
-from app.api.deps import ArqPool, CurrentIdentity, DbSession
+from app.api.deps import ArqPool, CurrentIdentity, DbSession, require_email_delivery
 from app.api.rate_limit import rate_limit_by_ip, rate_limit_by_org
 from app.core.audit import service as audit_service
 from app.core.audit.schemas import AuditLogEntry, AuditLogQuery
+from app.core.auth import email_verification
 from app.core.auth import service as auth_service
-from app.core.auth.schemas import SessionTokens
+from app.core.auth.schemas import VerificationRequested
 from app.core.tenancy import service as tenancy_service
 from app.core.tenancy.schemas import (
     AccessRule,
@@ -443,19 +444,26 @@ _INVITATION_ACCEPT_RATE_LIMIT = rate_limit_by_ip(
 
 @admin_router.post(
     "/invitations/{invitation_id}/accept",
-    response_model=SessionTokens,
-    dependencies=[Depends(_INVITATION_ACCEPT_RATE_LIMIT)],
+    response_model=VerificationRequested,
+    status_code=202,
+    dependencies=[Depends(_INVITATION_ACCEPT_RATE_LIMIT), Depends(require_email_delivery)],
 )
 async def accept_invitation(
-    invitation_id: uuid.UUID, data: InvitationAcceptRequest, session: DbSession
-) -> SessionTokens:
+    invitation_id: uuid.UUID,
+    data: InvitationAcceptRequest,
+    session: DbSession,
+    background_tasks: BackgroundTasks,
+) -> VerificationRequested:
     """Deliberately unauthenticated -- see this module's docstring. Requires
     the single-use token returned exactly once by `create_invitation`
     (`Invitation.token`), not just the invitation id, since Phase 7.5 (see
     `auth_service.accept_invitation_with_password`'s docstring for why this
     orchestration lives in `core.auth`, not here or in `core.tenancy`).
     """
-    return await auth_service.accept_invitation_with_password(session, invitation_id, data)
+    delivery = await auth_service.accept_invitation_with_password(session, invitation_id, data)
+    if delivery is not None:
+        background_tasks.add_task(email_verification.deliver_verification_email, delivery)
+    return VerificationRequested()
 
 
 @admin_router.post("/invitations/{invitation_id}/revoke", response_model=Invitation)

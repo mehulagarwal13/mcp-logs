@@ -36,6 +36,32 @@ from pydantic import BaseModel, ConfigDict, Field
 # existing caller's default search behavior is unchanged.
 CollectionName = Literal["documentation", "code", "conversations", "incidents"]
 
+# How many results one retrieval call may ask for. The upper bound is not
+# arbitrary: dense search runs an HNSW scan whose candidate list
+# (`hnsw.ef_search`, see `PgVectorStore`) is sized for result counts of this
+# order, and a request larger than the whole tenant forces an exact retry over
+# every row it owns. Unbounded values were reachable by any authenticated caller
+# through `POST /search/similar-incidents` and `POST /search/recent-changes`.
+# The largest value any internal caller passes today is 24 (the Retrieval
+# Agent's candidate pool).
+MIN_TOP_K = 1
+MAX_TOP_K = 100
+DEFAULT_TOP_K = 10
+
+
+def validate_top_k(top_k: int) -> int:
+    """Return `top_k` if it is an integer in `[MIN_TOP_K, MAX_TOP_K]`, else
+    raise `ValueError`. A programming-error guard for internal callers; the REST
+    layer enforces the same bounds declaratively (HTTP 422) so a user never
+    reaches this with a bad value. `bool` is rejected explicitly because
+    `True`/`False` are `int`s in Python.
+    """
+    if isinstance(top_k, bool) or not isinstance(top_k, int):
+        raise ValueError(f"top_k must be an integer, got {type(top_k).__name__}.")
+    if not MIN_TOP_K <= top_k <= MAX_TOP_K:
+        raise ValueError(f"top_k must be between {MIN_TOP_K} and {MAX_TOP_K}, got {top_k}.")
+    return top_k
+
 
 class SearchFilters(BaseModel):
     """The hard constraints applied *on the search query itself*

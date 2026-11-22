@@ -13,9 +13,37 @@ from app.core.auth import service as auth_service
 from app.core.auth.schemas import RefreshRequest, VerifiedIdPClaims
 from app.core.exceptions import PermissionDeniedError
 from app.core.tenancy.schemas import ProvisioningDecision
+from app.core.users.schemas import UserEmailState
 from app.shared.security import KmsUnavailableError, hash_opaque_token
 
 _JWT_SECRET = "unit-test-only-signing-key-with-32-bytes-minimum"
+
+
+async def _noop_set_tenant_context(session, organization_id) -> None:
+    """`_resolve_or_provision_user` now sets the tenant context explicitly (its
+    first query hits an RLS-protected table). These orchestration tests run with
+    `session=None`, so they stub it; the ordering itself is asserted in
+    `tests/core/tenancy/test_create_organization_tenant_context.py`.
+    """
+
+
+def _email_state(
+    *, verified: bool = True, active: bool = True, has_password: bool = True, email: str = "user@example.test"
+) -> UserEmailState:
+    return UserEmailState(
+        user_id=uuid.uuid4(),
+        email=email,
+        email_verified_at=datetime.now(UTC) if verified else None,
+        is_active=active,
+        has_password=has_password,
+    )
+
+
+def _patch_user_state(monkeypatch, state) -> None:
+    async def fake_state(session, user_id):
+        return state
+
+    monkeypatch.setattr(auth_service.users_service, "get_user_email_state_by_id", fake_state)
 
 
 def _settings():
@@ -54,6 +82,7 @@ class _RefreshRow:
         self.organization_id = organization_id
         self.family_id = uuid.uuid4()
         self.revoked_at = revoked_at
+        self.oauth_client_id = None
         self.expires_at = expires_at or now + timedelta(days=30)
 
 
@@ -178,6 +207,7 @@ async def test_refresh_rotates_token_in_same_family(monkeypatch) -> None:
     monkeypatch.setattr(auth_service.repository, "get_refresh_token_by_hash", fake_get_row)
     monkeypatch.setattr(auth_service.repository, "revoke_refresh_token", fake_revoke)
     monkeypatch.setattr(auth_service, "_issue_session", fake_issue)
+    _patch_user_state(monkeypatch, _email_state())
 
     result = await auth_service.refresh(None, RefreshRequest(refresh_token="old-refresh-token"))
 
@@ -251,8 +281,9 @@ async def test_sso_provisioning_denial_is_owned_by_tenancy_even_if_email_exists(
     monkeypatch,
 ) -> None:
     """An existing account/email alone must not make SSO provisioning allowed."""
+    monkeypatch.setattr(auth_service, "set_tenant_context", _noop_set_tenant_context)
     organization_id = uuid.uuid4()
-    idp_claims = VerifiedIdPClaims(sub="subject", email="existing@example.test")
+    idp_claims = VerifiedIdPClaims(sub="subject", email="existing@example.test", email_verified=True)
     user_creation_calls: list[str] = []
     role_calls: list[dict[str, object]] = []
 
@@ -264,8 +295,8 @@ async def test_sso_provisioning_denial_is_owned_by_tenancy_even_if_email_exists(
         assert groups == ()
         return ProvisioningDecision(allowed=False, reason="no_matching_policy")
 
-    async def fake_get_or_create_user(*args, **kwargs):
-        user_creation_calls.append("get_or_create")
+    async def fake_resolve_user(*args, **kwargs):
+        user_creation_calls.append("resolve_user_for_sso_provisioning")
         return uuid.uuid4()
 
     async def fake_assign_role(*args, **kwargs):
@@ -273,7 +304,9 @@ async def test_sso_provisioning_denial_is_owned_by_tenancy_even_if_email_exists(
 
     monkeypatch.setattr(auth_service.repository, "get_external_identity_mapping", fake_get_mapping)
     monkeypatch.setattr(auth_service.tenancy_service, "evaluate_provisioning", fake_evaluate)
-    monkeypatch.setattr(auth_service.users_service, "get_or_create_user", fake_get_or_create_user)
+    monkeypatch.setattr(
+        auth_service.users_service, "resolve_user_for_sso_provisioning", fake_resolve_user
+    )
     monkeypatch.setattr(auth_service.users_service, "assign_role", fake_assign_role)
 
     with pytest.raises(PermissionDeniedError, match="has not been provisioned"):
@@ -289,9 +322,12 @@ async def test_sso_provisioning_denial_is_owned_by_tenancy_even_if_email_exists(
 
 @pytest.mark.asyncio
 async def test_sso_provisioning_assigns_role_from_tenancy_decision(monkeypatch) -> None:
+    monkeypatch.setattr(auth_service, "set_tenant_context", _noop_set_tenant_context)
     organization_id, user_id, role_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     invitation_id = uuid.uuid4()
-    idp_claims = VerifiedIdPClaims(sub="subject", email="new@example.test", groups=("Engineering",))
+    idp_claims = VerifiedIdPClaims(
+        sub="subject", email="new@example.test", groups=("Engineering",), email_verified=True
+    )
     calls: list[tuple[str, object]] = []
 
     async def fake_get_mapping(session, org_id, subject):
@@ -306,7 +342,7 @@ async def test_sso_provisioning_assigns_role_from_tenancy_decision(monkeypatch) 
             reason="invitation_match",
         )
 
-    async def fake_get_or_create_user(session, *, email, display_name):
+    async def fake_resolve_user(session, *, email, display_name):
         calls.append(("create", email))
         return user_id
 
@@ -321,7 +357,9 @@ async def test_sso_provisioning_assigns_role_from_tenancy_decision(monkeypatch) 
 
     monkeypatch.setattr(auth_service.repository, "get_external_identity_mapping", fake_get_mapping)
     monkeypatch.setattr(auth_service.tenancy_service, "evaluate_provisioning", fake_evaluate)
-    monkeypatch.setattr(auth_service.users_service, "get_or_create_user", fake_get_or_create_user)
+    monkeypatch.setattr(
+        auth_service.users_service, "resolve_user_for_sso_provisioning", fake_resolve_user
+    )
     monkeypatch.setattr(auth_service.users_service, "assign_role", fake_assign_role)
     monkeypatch.setattr(auth_service.tenancy_service, "accept_invitation", fake_accept_invitation)
     monkeypatch.setattr(
@@ -343,6 +381,7 @@ async def test_sso_provisioning_assigns_role_from_tenancy_decision(monkeypatch) 
 
 @pytest.mark.asyncio
 async def test_sso_provisioning_reuses_existing_external_identity_mapping(monkeypatch) -> None:
+    monkeypatch.setattr(auth_service, "set_tenant_context", _noop_set_tenant_context)
     user_id = uuid.uuid4()
 
     async def fake_get_mapping(session, org_id, subject):
@@ -353,12 +392,110 @@ async def test_sso_provisioning_reuses_existing_external_identity_mapping(monkey
 
     monkeypatch.setattr(auth_service.repository, "get_external_identity_mapping", fake_get_mapping)
     monkeypatch.setattr(auth_service.tenancy_service, "evaluate_provisioning", should_not_evaluate)
+    _patch_user_state(monkeypatch, _email_state())
 
     result = await auth_service._resolve_or_provision_user(
         None,
         organization_id=uuid.uuid4(),
         idp_subject="existing-subject",
-        idp_claims=VerifiedIdPClaims(sub="existing-subject", email="user@example.test"),
+        idp_claims=VerifiedIdPClaims(
+            sub="existing-subject", email="user@example.test", email_verified=True
+        ),
     )
 
     assert result == user_id
+
+
+# --- email-verification policy for SSO provisioning / linking ----------------------
+
+
+@pytest.mark.asyncio
+async def test_unverified_idp_claims_never_reach_invitation_matching_or_provisioning(monkeypatch) -> None:
+    """Defence in depth: even if something built `VerifiedIdPClaims` without the
+    evidence, nothing downstream (invitation match, domain rule, account link) runs."""
+    monkeypatch.setattr(auth_service, "set_tenant_context", _noop_set_tenant_context)
+    touched: list[str] = []
+
+    async def spy(*args, **kwargs):
+        touched.append("called")
+
+    monkeypatch.setattr(auth_service.repository, "get_external_identity_mapping", spy)
+    monkeypatch.setattr(auth_service.tenancy_service, "evaluate_provisioning", spy)
+    monkeypatch.setattr(auth_service.users_service, "resolve_user_for_sso_provisioning", spy)
+    unverified = VerifiedIdPClaims(sub="s", email="victim@corp.test")  # email_verified defaults to False
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await auth_service._resolve_or_provision_user(
+            None, organization_id=uuid.uuid4(), idp_subject="s", idp_claims=unverified
+        )
+
+    assert exc_info.value.error_code == "auth.idp_email_not_verified"
+    assert touched == []
+
+
+def test_verified_idp_claims_default_to_unverified() -> None:
+    assert VerifiedIdPClaims(sub="s", email="a@b.test").email_verified is False
+
+
+@pytest.mark.asyncio
+async def test_returning_sso_user_without_a_password_is_verified_by_the_idp_proof(monkeypatch) -> None:
+    """A legacy SSO-only account (no local password, so no second credential a
+    squatter could hold) whose own address the IdP has now proven is marked verified."""
+    marked: list[tuple[uuid.UUID, str]] = []
+    state = _email_state(verified=False, has_password=False, email="User@Example.test")
+    _patch_user_state(monkeypatch, state)
+
+    async def fake_mark(session, *, user_id, via):
+        marked.append((user_id, via))
+
+    monkeypatch.setattr(auth_service.users_service, "mark_email_verified", fake_mark)
+    claims = VerifiedIdPClaims(sub="s", email="user@example.test", email_verified=True)
+
+    await auth_service._ensure_mapped_user_email_verified(None, state.user_id, claims)
+
+    assert marked == [(state.user_id, "oidc")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state_kwargs",
+    [
+        {"has_password": True},  # a local password exists: a squatter could hold it
+        {"has_password": False, "email": "different@example.test"},  # IdP proved another address
+        {"has_password": False, "active": False},  # deactivated accounts are never revived
+    ],
+    ids=["has-password", "email-mismatch", "inactive"],
+)
+async def test_returning_sso_user_is_not_auto_verified_when_proof_does_not_cover_the_account(
+    monkeypatch, state_kwargs
+) -> None:
+    marked: list[object] = []
+    state = _email_state(verified=False, **state_kwargs)
+    _patch_user_state(monkeypatch, state)
+
+    async def fake_mark(*args, **kwargs):
+        marked.append(args)
+
+    monkeypatch.setattr(auth_service.users_service, "mark_email_verified", fake_mark)
+    claims = VerifiedIdPClaims(sub="s", email="user@example.test", email_verified=True)
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await auth_service._ensure_mapped_user_email_verified(None, state.user_id, claims)
+
+    assert exc_info.value.error_code == "auth.email_not_verified"
+    assert marked == []
+
+
+@pytest.mark.asyncio
+async def test_returning_sso_user_who_is_already_verified_is_untouched(monkeypatch) -> None:
+    state = _email_state(verified=True)
+    _patch_user_state(monkeypatch, state)
+
+    async def fail(*args, **kwargs):
+        raise AssertionError("must not re-verify")
+
+    monkeypatch.setattr(auth_service.users_service, "mark_email_verified", fail)
+
+    await auth_service._ensure_mapped_user_email_verified(
+        None, state.user_id, VerifiedIdPClaims(sub="s", email="user@example.test", email_verified=True)
+    )

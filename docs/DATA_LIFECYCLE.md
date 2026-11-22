@@ -125,6 +125,8 @@ POST /users/{id}/data-deletion
         ↓
 Authorization      tenancy:manage, via the existing require_permission
         ↓          organization = actor.organization_id (never a parameter)
+Safeguards         target must be a CURRENT member of the actor's org,
+        ↓          must not be the actor, must not be the org's last admin
 Discovery          count rows per category — read-only
         ↓
 Plan               DeletionPlan: per-category action + count + rationale
@@ -142,14 +144,65 @@ Result             completed | partially_completed | failed
 `plan_user_data_deletion` and acts on its output, so the preview cannot drift
 from real behavior.
 
+### Safeguards (who may be deleted, and what happens to the account)
+
+These apply to both the dry run and the real run, and exist because `users`
+is a **global** table without row-level security — nothing in the database
+stops an organization admin's request from reaching another tenant's account
+unless the service refuses first.
+
+| Rule | Behavior |
+|---|---|
+| Target must be a current member of the caller's organization (holds a role there) | Otherwise `404 privacy.user_not_found` — identical to a nonexistent user, so the endpoint cannot be used to probe other tenants. No mutation of any kind happens. |
+| No self-deletion | `400 privacy.cannot_delete_self`, even if another admin exists. Ask another admin. A self-service flow is a separate, undecided feature. |
+| Last admin protected | `409 org.last_admin` if the target is the organization's only active, verified holder of `tenancy:manage`. Re-checked under a per-organization lock before any mutation, so two admins deleting each other concurrently cannot both succeed. |
+| Multi-organization users keep their global account | This organization's sessions, roles, project memberships, SSO links, executions and invitations are removed. The `users` row is anonymized **only if the person holds no role in any organization afterwards**; otherwise the `user_record` step is reported as `retain` and email, name, password and `is_active` are untouched. |
+
+**Locking.** Execution takes two transaction-scoped locks before it mutates
+anything, always in this order:
+
+1. A per-organization advisory lock (`pg_advisory_xact_lock`), then a read of
+   the admin set with `SELECT … FOR UPDATE OF user_roles`, then the last-admin
+   decision. Any future code that removes or demotes an admin must call
+   `core.users.service.assert_organization_keeps_an_admin(..., lock=True)`
+   first; the row lock alone makes a naive writer wait but does not make its
+   decision correct.
+2. `SELECT … FOR UPDATE` on the person's global `users` row. This serializes
+   two organizations deleting the same multi-organization person (the second
+   one sees the first one's committed result, so someone always ends up
+   anonymizing the account once no membership remains), and it conflicts with
+   the `FOR SHARE` lock `core.users.service.assign_role` now takes, so an
+   invitation acceptance / SSO provisioning cannot add a membership while the
+   anonymize-or-retain decision is being made. A grant that loses the race is
+   refused (`user.inactive`) instead of attaching a role to an anonymized
+   account; a grant that wins is seen by the deletion, which then keeps the
+   account.
+
+Membership is re-verified and the anonymize-or-retain decision is taken only
+after both locks are held.
+
+### Recovery from a partial failure — membership is removed last
+
+Steps run in this order: sessions → project memberships → SSO links → agent
+executions → private memory → invitations → global account (anonymize or
+retain) → **organization membership (`user_roles`)**. The membership row is
+what lets an admin retry (the target must be a current member), so it is
+deleted only after everything else succeeded. If any earlier step fails, the
+global account and the membership are *not* touched, those two steps are
+reported as failed with "skipped because an earlier cleanup step failed", the
+status is `partially_completed`, and the identical request can be repeated.
+Only a fully completed run leaves the person a non-member.
+
 ### Idempotency
 
 Every mutation is a `DELETE/UPDATE … WHERE` that matches zero rows once
-applied, so re-running is a successful no-op rather than an error. The result
-sets `was_noop=true` when the user record was already anonymized on entry —
-the signal that distinguishes "this run did the work" from "a previous run
-already had", which a zero row-count alone cannot express. Retry after a
-partial failure is the supported recovery path.
+applied. After a *completed* deletion the person is no longer a member, so a
+repeat call answers `404` rather than a zero-row success. `was_noop=true` is
+retained for an already-anonymized user who still holds a role. Remaining
+limit: a database error inside a step aborts the Postgres transaction, so the
+whole request rolls back (nothing is partially committed); only
+non-database failures commit partial state, and those are what the ordering
+above recovers from.
 
 ### Partial failure
 

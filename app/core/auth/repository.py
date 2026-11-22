@@ -24,9 +24,10 @@ from collections.abc import Sequence
 from datetime import datetime
 
 from sqlalchemy import select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models.auth_models import RefreshToken
+from app.database.models.auth_models import EmailVerification, RefreshToken
 from app.database.models.tenancy_models import ExternalIdentityMapping
 
 # --- Refresh tokens ----------------------------------------------------------
@@ -40,6 +41,7 @@ async def insert_refresh_token(
     family_id: uuid.UUID,
     token_hash: str,
     expires_at: datetime,
+    oauth_client_id: str | None = None,
 ) -> RefreshToken:
     """Create one refresh token row and return it with server defaults populated.
 
@@ -54,6 +56,7 @@ async def insert_refresh_token(
         family_id=family_id,
         token_hash=token_hash,
         expires_at=expires_at,
+        oauth_client_id=oauth_client_id,
     )
     session.add(row)
     await session.flush()
@@ -239,3 +242,114 @@ async def insert_external_identity_mapping(
     await session.flush()
     await session.refresh(row)
     return row
+
+
+# --- Email verification challenges ---------------------------------------------
+#
+# `email_verifications` is global (not RLS-protected; see its model docstring),
+# so none of these need a tenant context.
+
+
+async def get_open_verification_for_update(
+    session: AsyncSession, *, email: str, kind: str
+) -> EmailVerification | None:
+    """The single not-yet-consumed challenge for (email, kind), row-locked.
+
+    `FOR UPDATE` serialises concurrent signup/resend requests for the same
+    address so the cooldown/daily-cap bookkeeping in the service is not
+    racy. The partial unique index guarantees at most one such row.
+    """
+    stmt = (
+        select(EmailVerification)
+        .where(
+            EmailVerification.email == email,
+            EmailVerification.kind == kind,
+            EmailVerification.consumed_at.is_(None),
+        )
+        .with_for_update()
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def insert_open_verification_if_absent(
+    session: AsyncSession, *, values: dict
+) -> uuid.UUID | None:
+    """INSERT ... ON CONFLICT DO NOTHING against the open-(email, kind)
+    unique index. Returns the new id, or None if an open row already exists
+    (a concurrent request won the race -- the caller re-selects it FOR UPDATE).
+    """
+    stmt = (
+        pg_insert(EmailVerification)
+        .values(**values)
+        .on_conflict_do_nothing(
+            index_elements=["email", "kind"], index_where=text("consumed_at IS NULL")
+        )
+        .returning(EmailVerification.id)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def consume_verification_by_hash(
+    session: AsyncSession, *, token_hash: str, now: datetime
+) -> EmailVerification | None:
+    """THE single-use gate: atomically mark the matching, unconsumed,
+    unexpired challenge consumed and return it.
+
+    One statement, so two concurrent requests presenting the same token are
+    serialised by Postgres' row lock; the loser re-evaluates the WHERE clause
+    against the committed row, sees `consumed_at` set, and matches nothing.
+    The caller runs this in the same transaction as the activation work, so
+    if activation fails the consumption rolls back with it.
+    """
+    stmt = (
+        update(EmailVerification)
+        .where(
+            EmailVerification.token_hash == token_hash,
+            EmailVerification.consumed_at.is_(None),
+            EmailVerification.expires_at > now,
+        )
+        .values(consumed_at=now)
+        .returning(EmailVerification)
+        .execution_options(populate_existing=True)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def get_verification_by_hash(
+    session: AsyncSession, token_hash: str
+) -> EmailVerification | None:
+    """Read-only lookup used only to *explain* a failed consume (unknown /
+    expired / already used) to the holder of the token."""
+    stmt = select(EmailVerification).where(EmailVerification.token_hash == token_hash)
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def delete_stale_verifications(
+    session: AsyncSession, *, expired_before: datetime, consumed_before: datetime
+) -> int:
+    """Housekeeping: drop challenges that expired or were consumed before the
+    given cut-offs. Never touches `users`/`organizations`."""
+    from sqlalchemy import delete, or_
+
+    stmt = delete(EmailVerification).where(
+        or_(
+            EmailVerification.expires_at < expired_before,
+            EmailVerification.consumed_at < consumed_before,
+        )
+    )
+    result = await session.execute(stmt)
+    return result.rowcount or 0
+
+
+async def resolve_invitation_organization_id(
+    session: AsyncSession, invitation_id: uuid.UUID
+) -> uuid.UUID | None:
+    """Resolve only the owning organization of an invitation id through the
+    narrow `resolve_invitation_organization` SECURITY DEFINER function (see
+    `d5f2a8c1e9b4_email_verification.py`): the unauthenticated accept endpoint
+    has no tenant context and `invitations` is FORCE RLS."""
+    result = await session.execute(
+        text("SELECT resolve_invitation_organization(:invitation_id)"),
+        {"invitation_id": str(invitation_id)},
+    )
+    return result.scalar_one_or_none()

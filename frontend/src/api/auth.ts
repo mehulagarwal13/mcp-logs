@@ -10,6 +10,8 @@ import type {
   SessionTokens,
   SignupPayload,
   SwitchOrganizationPayload,
+  VerificationRequested,
+  VerifyEmailResult,
 } from "@/types/auth";
 
 interface UserProfileResponse {
@@ -37,11 +39,49 @@ const MOCK_TOKENS: SessionTokens = {
   expiresIn: 3600,
 };
 
-export async function signup(payload: SignupPayload): Promise<SessionTokens> {
+const MOCK_VERIFICATION_REQUESTED: VerificationRequested = {
+  status: "verification_sent",
+  message: "If this address can be used, a confirmation email is on its way.",
+};
+
+/**
+ * `POST /auth/signup` (202). Creates NO account and returns NO tokens: the
+ * backend only records a pending registration and emails a confirmation
+ * link. The account exists once that link has been opened
+ * (`verifyEmail`), after which the user signs in normally.
+ */
+export async function signup(payload: SignupPayload): Promise<VerificationRequested> {
   if (USE_MOCK_DATA) {
-    return mockDelay(MOCK_TOKENS, 400);
+    return mockDelay(MOCK_VERIFICATION_REQUESTED, 400);
   }
-  return apiRequest<SessionTokens>("/auth/signup", { method: "POST", body: payload });
+  return apiRequest<VerificationRequested>("/auth/signup", { method: "POST", body: payload });
+}
+
+/**
+ * `POST /auth/verify-email`. `token` comes from the URL fragment of the
+ * emailed link and is held in memory only (never localStorage/sessionStorage,
+ * never logged). Resolves only if the SERVER consumed the token -- the UI
+ * must not show success any other way. Returns no session.
+ */
+export async function verifyEmail(token: string): Promise<VerifyEmailResult> {
+  if (USE_MOCK_DATA) {
+    return mockDelay({ status: "verified" }, 300);
+  }
+  return apiRequest<VerifyEmailResult>("/auth/verify-email", { method: "POST", body: { token } });
+}
+
+/**
+ * `POST /auth/email-verification/resend` (always 202, whether or not anything
+ * was sent). Rate limited server-side; a UI cooldown is only a courtesy.
+ */
+export async function resendVerification(email: string): Promise<VerificationRequested> {
+  if (USE_MOCK_DATA) {
+    return mockDelay(MOCK_VERIFICATION_REQUESTED, 300);
+  }
+  return apiRequest<VerificationRequested>("/auth/email-verification/resend", {
+    method: "POST",
+    body: { email },
+  });
 }
 
 export async function login(payload: LoginPayload): Promise<LoginResponse> {
@@ -105,19 +145,21 @@ export async function listMyOrganizations(): Promise<OrganizationsListResponse> 
 }
 
 /**
- * Backend: `POST /invitations/{invitation_id}/accept` (Phase 7.5). Deliberately
- * unauthenticated -- there is no session yet -- so `payload.token` (the
- * single-use secret from the invitation link, distinct from `invitationId`
- * itself) is what proves the caller controls the invited email address.
+ * Backend: `POST /invitations/{invitation_id}/accept`. Deliberately
+ * unauthenticated -- there is no session yet. `payload.token` (the secret from
+ * the invitation link) only authorises STARTING acceptance: it is visible to
+ * the inviting admin, so it is not proof of mailbox control. The backend
+ * emails a confirmation link to the invited address and finishes the
+ * acceptance when that link is opened; no session is returned.
  */
 export async function acceptInvitation(
   invitationId: string,
   payload: InvitationAcceptPayload,
-): Promise<SessionTokens> {
+): Promise<VerificationRequested> {
   if (USE_MOCK_DATA) {
-    return mockDelay(MOCK_TOKENS, 400);
+    return mockDelay(MOCK_VERIFICATION_REQUESTED, 400);
   }
-  return apiRequest<SessionTokens>(`/invitations/${invitationId}/accept`, {
+  return apiRequest<VerificationRequested>(`/invitations/${invitationId}/accept`, {
     method: "POST",
     body: payload,
   });

@@ -50,7 +50,8 @@ from typing import Any
 
 import httpx
 
-from app.core.tenancy.schemas import ConnectorConfig
+from app.agents.investigation.live.base import LiveSourceAuthError, LiveSourceError
+from app.core.tenancy.live_credentials import LiveConnectorCredential
 from app.shared.config.logging import get_logger
 from app.shared.schemas import EvidenceItem
 
@@ -61,6 +62,17 @@ _GITHUB_API_VERSION = "2022-11-28"
 _MAX_REPOS_PER_CALL = 5  # bounds latency and Search API rate-limit usage per lookup
 _PER_ENDPOINT_RESULTS = 10  # per repo, per endpoint (issues+PRs, commits)
 _SUMMARY_MAX_CHARS = 300
+
+
+def _is_auth_failure(exc: httpx.HTTPStatusError) -> bool:
+    """A 401 is always a rejected credential. A 403 can also be GitHub's
+    rate limiting (`x-ratelimit-remaining: 0`), which is transient and not an
+    auth problem, so only treat 403 as auth when the budget is not exhausted.
+    """
+    status_code = exc.response.status_code
+    if status_code == 401:
+        return True
+    return status_code == 403 and exc.response.headers.get("x-ratelimit-remaining") != "0"
 
 
 class GitHubLiveSource:
@@ -78,12 +90,12 @@ class GitHubLiveSource:
     async def fetch_live_evidence(
         self,
         *,
-        connector_config: ConnectorConfig,
+        connector: LiveConnectorCredential,
         query: str,
         since: datetime,
         limit: int,
     ) -> list[EvidenceItem]:
-        repos: list[dict[str, str]] = list(connector_config.config.get("repos", []))[
+        repos: list[dict[str, str]] = list(connector.config.get("repos", []))[
             :_MAX_REPOS_PER_CALL
         ]
         if not repos:
@@ -91,12 +103,14 @@ class GitHubLiveSource:
 
         since_date = since.astimezone(UTC).date().isoformat()
         headers = {
-            "Authorization": f"Bearer {connector_config.credential_ref}",
+            "Authorization": f"Bearer {connector.reveal_token()}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": _GITHUB_API_VERSION,
         }
 
         evidence: list[EvidenceItem] = []
+        attempted = 0
+        failed = 0
         async with httpx.AsyncClient(
             base_url=_GITHUB_API_BASE_URL, headers=headers, timeout=15.0
         ) as http:
@@ -104,17 +118,27 @@ class GitHubLiveSource:
                 repo = repo_entry.get("repo")
                 if not repo:
                     continue
-                evidence.extend(
-                    await self._search_issues_and_pulls(http, repo, query, since_date)
-                )
-                evidence.extend(await self._search_commits(http, repo, query))
+                for found in (
+                    await self._search_issues_and_pulls(http, repo, query, since_date),
+                    await self._search_commits(http, repo, query),
+                ):
+                    attempted += 1
+                    if found is None:
+                        failed += 1
+                    else:
+                        evidence.extend(found)
+
+        if attempted and failed == attempted:
+            # Every request failed (an auth failure raises earlier): do not
+            # report this as "nothing relevant found".
+            raise LiveSourceError("all GitHub live requests failed")
 
         evidence.sort(key=lambda item: item.source_timestamp or since, reverse=True)
         return evidence[:limit]
 
     async def _search_issues_and_pulls(
         self, http: httpx.AsyncClient, repo: str, query: str, since_date: str
-    ) -> list[EvidenceItem]:
+    ) -> list[EvidenceItem] | None:
         search_query = f"{query} repo:{repo} updated:>={since_date}"
         try:
             response = await http.get(
@@ -128,9 +152,16 @@ class GitHubLiveSource:
             )
             response.raise_for_status()
             items: list[dict[str, Any]] = response.json().get("items", [])
+        except httpx.HTTPStatusError as exc:
+            if _is_auth_failure(exc):
+                raise LiveSourceAuthError("GitHub rejected the connector credential") from None
+            logger.warning(
+                "github_live_search_issues_failed", repo=repo, status=exc.response.status_code
+            )
+            return None
         except Exception as exc:
             logger.warning("github_live_search_issues_failed", repo=repo, error=str(exc))
-            return []
+            return None
 
         evidence: list[EvidenceItem] = []
         for item in items:
@@ -155,7 +186,7 @@ class GitHubLiveSource:
 
     async def _search_commits(
         self, http: httpx.AsyncClient, repo: str, query: str
-    ) -> list[EvidenceItem]:
+    ) -> list[EvidenceItem] | None:
         search_query = f"{query} repo:{repo}"
         try:
             response = await http.get(
@@ -169,9 +200,16 @@ class GitHubLiveSource:
             )
             response.raise_for_status()
             items: list[dict[str, Any]] = response.json().get("items", [])
+        except httpx.HTTPStatusError as exc:
+            if _is_auth_failure(exc):
+                raise LiveSourceAuthError("GitHub rejected the connector credential") from None
+            logger.warning(
+                "github_live_search_commits_failed", repo=repo, status=exc.response.status_code
+            )
+            return None
         except Exception as exc:
             logger.warning("github_live_search_commits_failed", repo=repo, error=str(exc))
-            return []
+            return None
 
         evidence: list[EvidenceItem] = []
         for item in items:

@@ -6022,3 +6022,35 @@ That completes the fixed Stages 24–29 plan. The next topic would require expli
 
 
 
+**Source-level caveat about live evidence:** the live lookup path gets connector configurations through `tenancy_service.list_connectors()`. That service requires `tenancy:manage` and returns redacted connector credentials. The caller catches failures and proceeds without live evidence. So an investigation may complete without live lookups—for example, if the actor lacks that permission—and the source code alone does not establish that the live lookup path succeeds for every investigator.
+
+### 3. It generates hypotheses from that evidence
+
+If no evidence was collected, the node skips hypothesis generation and returns an investigation result saying no automated evidence was found, with no hypotheses. It does not spend an LLM call asking the model to reason from nothing.
+
+Otherwise, `generate_hypotheses` makes an LLM call. Its prompt instructs the model to use only the gathered evidence and return hypotheses, confidence values, a suggested owner team, and suggested next steps.
+
+The code then validates the response. A hypothesis needs a description, a numeric confidence value, and at least one supporting reference that matches an actual `EvidenceItem.reference`. Invented or invalid references are removed; a hypothesis with no remaining valid reference is discarded. The confidence value is clamped to 0–1.If this generation step fails after retries, the investigation degrades to no hypotheses and recommends manual evidence review. 4. It may critique and revise the hypotheses
+
+When hypotheses exist and critique is enabled, `review_investigation` checks them before they are returned:
+
+- **Structural checks** flag thin evidence and high-confidence hypotheses supported by too few evidence items. If the overall evidence is below the configured minimum, the result can be rejectedwithout a critique call.
+- **Semantic critique** uses another LLM call to assess whether claims are supported by the evidence and whether the evidence appears contradictory. It receives the already-gathered evidence; it does not perform new searches.
+- If the critique says **revise**, the agent gets **one** revision attempt and one follow-up critique. If that still says revise or reject, thehypotheses are rejected; there is no unbounded review loop.
+- If critique fails, the result says `review_failed` rather than claiming the hypotheses were reviewed.
+
+The returned `review_status` matters: `reviewed`, `not_reviewed`, and `review_failed` mean different things. A generated hypothesis is not automatically a verified root cause.
+
+### 5. It builds the response and may save an incident timeline entry
+
+The result uses the shared `AskResponse and InvestigationResult schemas`. On the investigation route, `route_taken` is `"investigation"` and the `investigation` field contains evidence, hypotheses,suggested owner team and next steps, plus critique metadata. It is not a normal answer: `answer` and `answer_mode` are not set, and there are no answer citations.
+
+If an `incident_id` was supplied, the node **best-effort** saves the structured findings to that incident’s timeline through`record_investigation_result`. The timeline write is logged but does not invalidate an otherwise complete response if it fails. For `/ask`, an incident ID is optional; direct triage always has one.
+
+Finally, `_run_graph_and_record` records the agent execution and token usage. Expected EKIP domain errors are recorded as failures and re-raised. An unexpected error is logged and returned as a generic failure-shaped `AskResponse`; in that case, the response may have `route_taken="investigation"` but no populated `investigation` result.
+
+## How direct incident triage differs
+
+`triage_incident` first loads and checks access to the incident, then builds its query from the incident’s **title and description**. It starts directly at the Investigation Agent, so it does not run the main graph’s Retrieval Agent or Confidence Evaluation first. This is why the response can have `route_taken="investigation"` even though no confidence-based routing occurred.
+
+**In short:** `/ask` investigates when its initial confidence check says the evidence is not strong enough for an answer. The investigation route then gathers evidence, generates evidence-linked hypotheses, optionally critiques and revises them, and returns a structured investigation—not a normal answer. // explain

@@ -179,7 +179,22 @@ async def answer_question(
     MCP (Milestone 8) exists yet to supply a real value -- `"core_api"` is
     the only trigger source honestly true of any caller today. Whichever of
     those is built first should pass its own real value explicitly.
+
+    When `incident_id` is supplied, the caller must be authorized to read
+    that incident -- same-organization and `incident:read` on the incident's
+    project, exactly the rule `triage_incident` applies -- and this is
+    checked FIRST, before memory recall, LLM setup, graph construction, or
+    any live-evidence lookup. A foreign/unknown incident raises
+    `NotFoundError` and an unreadable one `PermissionDeniedError`; because no
+    agent work has started, no `agent_executions` row is recorded (matching
+    `triage_incident`). `agents.retrieval.rewriting.rewrite_query` repeats
+    the same check as a second layer. Without an `incident_id`, behavior is
+    unchanged (and no live connector lookup can ever be triggered -- see
+    `agents.investigation.evidence`).
     """
+    if incident_id is not None:
+        await incidents_service.get_incident(session, actor, actor.organization_id, incident_id)
+
     llm = get_llm()
     graph = build_graph(session, llm)
 

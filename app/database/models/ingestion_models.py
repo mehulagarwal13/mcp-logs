@@ -90,6 +90,15 @@ class Document(Base):
             name="uq_documents_org_source_external_hash",
         ),
         Index("ix_documents_org_status", "organization_id", "status"),
+        # Serves "find the current version of this item" (ingestion) without
+        # scanning superseded history.
+        Index(
+            "ix_documents_current",
+            "organization_id",
+            "source",
+            "external_id",
+            postgresql_where=text("superseded_at IS NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -110,6 +119,15 @@ class Document(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     acl_permission_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set when a newer version of the same (organization_id, source,
+    # external_id) replaces this row. `NULL` means "this is the current
+    # version". Superseded rows are kept (never deleted by ingestion) so a
+    # citation's `document_id` keeps resolving; only their derived chunks are
+    # removed, and every read that must show *current* content (retrieval,
+    # `/knowledge` browse) filters on `superseded_at IS NULL`. Only
+    # connector-ingested documents are ever superseded -- manual documents
+    # bump `version` in place (`core.knowledge.repository`).
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -165,6 +165,10 @@ async def list_published_documents(
             Document.organization_id == organization_id,
             Document.status == "published",
             Document.deleted_at.is_(None),
+            # Current versions only: a re-synced connector document used to
+            # appear once per historical version. Old rows are kept (their
+            # ids still resolve via `get_document`), just not browsable.
+            Document.superseded_at.is_(None),
         )
         .order_by(Document.updated_at.desc())
     )

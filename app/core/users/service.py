@@ -13,12 +13,18 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import NotFoundError, PermissionDeniedError
+from app.core.exceptions import ConflictError, NotFoundError, PermissionDeniedError
 from app.core.users import repository
-from app.core.users.schemas import OrganizationMember, UserCredentialLookup, UserProfile
+from app.core.users.schemas import (
+    OrganizationMember,
+    UserCredentialLookup,
+    UserEmailState,
+    UserProfile,
+)
 from app.database.session import set_tenant_context
 from app.shared.config.logging import get_logger
 from app.shared.schemas import ActorKind, Identity
@@ -71,6 +77,16 @@ async def resolve_identity(
             "User account is inactive.",
             error_code="user.inactive",
             detail={"user_id": str(user_id)},
+        )
+    # The single choke point for already-issued access tokens (REST and MCP
+    # both resolve through here on every request): an account whose email
+    # ownership has not been established has no authenticated access, even
+    # with a validly signed, unexpired token. Zero extra queries -- the row
+    # is already loaded.
+    if user.email_verified_at is None:
+        raise PermissionDeniedError(
+            "This account's email address has not been verified.",
+            error_code="auth.email_not_verified",
         )
 
     role_names = await repository.get_role_names(session, user_id, organization_id)
@@ -158,9 +174,21 @@ async def list_organization_members(
 
 
 async def get_or_create_user(
-    session: AsyncSession, *, email: str, display_name: str
+    session: AsyncSession,
+    *,
+    email: str,
+    display_name: str,
+    email_verified_via: str | None = None,
 ) -> uuid.UUID:
     """Resolve `email` to a user, creating one if none exists yet.
+
+    TRUSTED-BOOTSTRAP ONLY (seed/e2e/operator scripts): this performs no
+    ownership check. Request paths must NOT call it with an email taken from
+    a request or an IdP claim -- they use `create_verified_user` (after a
+    consumed verification token) or `resolve_user_for_sso_provisioning`.
+    `email_verified_via` stamps a newly created row as verified (only ever
+    `"operator_attestation"` from a script); an existing row is returned
+    unchanged.
 
     Called only after a provisioning decision has already been made
     elsewhere (core/tenancy's `evaluate_provisioning`) -- this function
@@ -178,9 +206,112 @@ async def get_or_create_user(
     if existing is not None:
         return existing.id
 
-    created = await repository.insert_user(session, email=email, display_name=display_name)
+    created = await repository.insert_user(
+        session,
+        email=email,
+        display_name=display_name,
+        email_verified_at=datetime.now(timezone.utc) if email_verified_via else None,
+        email_verified_via=email_verified_via,
+    )
     logger.info("user_provisioned", user_id=str(created.id), email=email)
     return created.id
+
+
+async def find_user_id_by_email_ci(session: AsyncSession, email: str) -> uuid.UUID | None:
+    """Case-insensitive existence check used by signup/verification/linking."""
+    row = await repository.get_by_email_ci(session, email)
+    return row.id if row is not None else None
+
+
+def _email_state(row) -> UserEmailState:
+    return UserEmailState(
+        user_id=row.id,
+        email=row.email,
+        email_verified_at=row.email_verified_at,
+        is_active=row.is_active,
+        has_password=row.password_hash is not None,
+    )
+
+
+async def get_user_email_state(session: AsyncSession, email: str) -> UserEmailState | None:
+    """Email-ownership view of the user with `email` (case-insensitive), or
+    None -- the narrow shape the verification service needs, never an ORM row."""
+    row = await repository.get_by_email_ci(session, email)
+    return _email_state(row) if row is not None else None
+
+
+async def get_user_email_state_by_id(
+    session: AsyncSession, user_id: uuid.UUID
+) -> UserEmailState | None:
+    row = await repository.get_by_id(session, user_id)
+    return _email_state(row) if row is not None else None
+
+
+async def create_verified_user(
+    session: AsyncSession,
+    *,
+    email: str,
+    display_name: str,
+    password_hash: str | None,
+    via: str,
+) -> uuid.UUID:
+    """Create a brand-new user whose email ownership has JUST been proven
+    (consumed verification token, or an IdP that affirmatively verified it).
+    Refuses if any account (case-insensitive) already uses the address -- it
+    never adopts an existing row, which is the squatting/takeover shape this
+    change exists to remove.
+    """
+    if await repository.get_by_email_ci(session, email) is not None:
+        raise ConflictError(
+            "An account with this email already exists.",
+            error_code="auth.email_taken",
+        )
+    created = await repository.insert_user(
+        session,
+        email=email.strip().lower(),
+        display_name=display_name,
+        password_hash=password_hash,
+        email_verified_at=datetime.now(timezone.utc),
+        email_verified_via=via,
+    )
+    logger.info("user_provisioned", user_id=str(created.id), via=via)
+    return created.id
+
+
+async def mark_email_verified(session: AsyncSession, *, user_id: uuid.UUID, via: str) -> None:
+    await repository.mark_email_verified(
+        session, user_id=user_id, verified_at=datetime.now(timezone.utc), via=via
+    )
+
+
+async def resolve_user_for_sso_provisioning(
+    session: AsyncSession, *, email: str, display_name: str
+) -> uuid.UUID:
+    """User to attach a NEW SSO identity mapping to, given an email the IdP
+    has *affirmatively verified* (the caller guarantees that).
+
+    * no account with that address -> a new user, created already-verified
+      (`via="oidc"`), with no local password;
+    * an account exists and its own `email_verified_at` is set -> that
+      account (we have independent proof its owner controls the address);
+    * an account exists but is unverified (legacy / never proven) ->
+      `PermissionDeniedError`. Linking a fresh IdP identity to an account
+      whose ownership was never established would hand that account (and
+      whatever sessions/passwords a squatter holds on it) to a new login path.
+      The owner must first verify through the emailed link.
+    """
+    existing = await repository.get_by_email_ci(session, email)
+    if existing is None:
+        return await create_verified_user(
+            session, email=email, display_name=display_name, password_hash=None, via="oidc"
+        )
+    if existing.email_verified_at is None:
+        raise PermissionDeniedError(
+            "An account with this email exists but its address has not been verified. "
+            "Verify it via the emailed link, then sign in again.",
+            error_code="auth.account_email_unverified",
+        )
+    return existing.id
 
 
 async def assign_role(
@@ -208,6 +339,18 @@ async def assign_role(
     if existing is not None:
         return
 
+    # Serialize with account anonymization (`core.privacy`): take a shared
+    # lock on the person's global row and refuse an inactive/anonymized
+    # account. Without this, a role granted (invitation accept / SSO
+    # provisioning) concurrently with a data deletion could land on an
+    # account that is being, or has just been, anonymized.
+    if not await repository.lock_user_row(session, user_id, exclusive=False):
+        raise PermissionDeniedError(
+            "Cannot grant a role to an inactive or deleted account.",
+            error_code="user.inactive",
+            detail={"user_id": str(user_id)},
+        )
+
     await repository.insert_user_role(
         session, user_id=user_id, organization_id=organization_id, role_id=role_id
     )
@@ -217,6 +360,60 @@ async def assign_role(
         organization_id=str(organization_id),
         role_id=str(role_id),
     )
+
+
+async def is_organization_member(
+    session: AsyncSession, user_id: uuid.UUID, organization_id: uuid.UUID
+) -> bool:
+    """Whether `user_id` currently holds a role in `organization_id`."""
+    return await repository.is_organization_member(session, user_id, organization_id)
+
+
+async def lock_user_for_deletion(session: AsyncSession, user_id: uuid.UUID) -> bool:
+    """Take an exclusive lock on `user_id`'s global `users` row for the rest
+    of the transaction. Returns whether the user exists.
+
+    Used by data deletion so that (a) two organizations deleting the same
+    multi-organization person are serialized and the second sees the first's
+    committed result, and (b) `assign_role` (which takes the conflicting
+    shared lock) cannot add a membership while the anonymization decision is
+    being made.
+    """
+    return await repository.lock_user_row(session, user_id, exclusive=True) is not None
+
+
+async def assert_organization_keeps_an_admin(
+    session: AsyncSession,
+    organization_id: uuid.UUID,
+    removing_user_id: uuid.UUID,
+    *,
+    lock: bool,
+) -> None:
+    """Raise `ConflictError` if taking admin power away from
+    `removing_user_id` would leave `organization_id` with no admin.
+
+    Does nothing when `removing_user_id` is not currently an admin, or when
+    at least one *other* admin would remain.
+
+    `lock=False` is a plain read, for dry runs. `lock=True` is the form a
+    mutating operation must use, *before* it mutates: it first takes a
+    per-organization advisory lock and then re-reads (and row-locks) the
+    admin set, so two concurrent operations are serialized and the second
+    one sees the first one's committed result. Every present or future path
+    that deletes or demotes an admin (data deletion today; role changes or
+    removals later) must go through this function, or the guarantee does not
+    hold -- the lock only protects callers that take it.
+    """
+    if lock:
+        await repository.acquire_org_admin_lock(session, organization_id)
+    admins = await repository.list_org_admin_user_ids(session, organization_id, lock=lock)
+    if removing_user_id in admins and not (admins - {removing_user_id}):
+        raise ConflictError(
+            "This user is the organization's last admin. Grant admin access to "
+            "another user before removing this one.",
+            error_code="org.last_admin",
+            detail={"organization_id": str(organization_id)},
+        )
 
 
 def authorize(
@@ -267,7 +464,10 @@ async def get_credential_lookup(session: AsyncSession, email: str) -> UserCreden
     if row is None:
         return None
     return UserCredentialLookup(
-        user_id=row.id, password_hash=row.password_hash, is_active=row.is_active
+        user_id=row.id,
+        password_hash=row.password_hash,
+        is_active=row.is_active,
+        email_verified_at=row.email_verified_at,
     )
 
 

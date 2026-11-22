@@ -102,18 +102,19 @@ from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.investigation.live.base import LiveEvidenceSource
+from app.agents.investigation.live.base import LiveEvidenceSource, LiveSourceAuthError
 from app.agents.investigation.live.github_live import GitHubLiveSource
 from app.agents.investigation.live.monitoring_live import MonitoringLiveSource
 from app.agents.investigation.live.slack_live import SlackLiveSource
 from app.agents.retry import call_with_retry
+from app.core.exceptions import NotFoundError, PermissionDeniedError
 from app.core.incidents import service as incidents_service
 from app.core.tenancy import service as tenancy_service
 from app.retrieval import service as retrieval_service
 from app.retrieval.schemas import ScoredChunk, SearchFilters
 from app.shared.config.logging import get_logger
 from app.shared.config.settings import get_settings
-from app.shared.schemas import EvidenceItem, Identity
+from app.shared.schemas import EvidenceItem, Identity, LiveEvidenceStatus, LiveSourceOutcome
 
 logger = get_logger(__name__)
 
@@ -162,8 +163,27 @@ async def gather_evidence(
     retry_count: dict[str, int],
     incident_id: uuid.UUID | None = None,
 ) -> list[EvidenceItem]:
+    """`gather_evidence_with_status` without the live-evidence status, for
+    callers that only need the evidence list.
+    """
+    evidence, _live_status = await gather_evidence_with_status(
+        session, query=query, actor=actor, retry_count=retry_count, incident_id=incident_id
+    )
+    return evidence
+
+
+async def gather_evidence_with_status(
+    session: AsyncSession,
+    *,
+    query: str,
+    actor: Identity,
+    retry_count: dict[str, int],
+    incident_id: uuid.UUID | None = None,
+) -> tuple[list[EvidenceItem], LiveEvidenceStatus]:
     """Collect evidence for `query`, in priority order, stopping once
-    `_EVIDENCE_CAP` items are gathered.
+    `_EVIDENCE_CAP` items are gathered, and report whether live evidence was
+    collected (`LiveEvidenceStatus`) so a thin result is never mistaken for
+    "nothing found".
 
     `incident_id` is optional (default `None`, preserving every pre-existing
     caller's behavior unchanged) -- passed by `investigation.node` as
@@ -172,6 +192,13 @@ async def gather_evidence(
     incident-scoped `answer_question` call). It is one of
     `_should_augment_with_live_evidence`'s three signals for whether live
     evidence is worth fetching -- see that function's docstring.
+
+    Live GitHub/Slack lookups use the organization's connector tokens, which
+    can read more than any single user may see, so they run **only** for an
+    investigation attached to an incident the actor is authorized to read
+    (`incident:read` on its project, re-checked in `_gather_live_evidence`).
+    A question with no incident (`POST /ask` without `incident_id`) never
+    triggers them.
     """
     evidence: list[EvidenceItem] = []
     filters = SearchFilters(organization_id=actor.organization_id, permission_codes=actor.permissions)
@@ -193,14 +220,28 @@ async def gather_evidence(
     if len(evidence) < _EVIDENCE_CAP:
         evidence.extend(_gather_monitoring_evidence())
 
-    if (
-        len(evidence) < _EVIDENCE_CAP
-        and get_settings().investigation_live_evidence_enabled
-        and _should_augment_with_live_evidence(evidence, incident_id)
-    ):
-        evidence.extend(await _gather_live_evidence(session, query, actor, retry_count))
+    live_status = _not_attempted("indexed_evidence_sufficient")
+    if len(evidence) >= _EVIDENCE_CAP:
+        pass
+    elif not get_settings().investigation_live_evidence_enabled:
+        live_status = _not_attempted("disabled")
+    elif incident_id is None:
+        live_status = _not_attempted("no_incident_context")
+    elif _should_augment_with_live_evidence(evidence, incident_id):
+        live_items, live_status = await _gather_live_evidence(
+            session, query, actor, retry_count, incident_id
+        )
+        evidence.extend(live_items)
 
-    return evidence[:_EVIDENCE_CAP]
+    return evidence[:_EVIDENCE_CAP], live_status
+
+
+def _not_attempted(reason: str) -> LiveEvidenceStatus:
+    return LiveEvidenceStatus(status="not_attempted", reason=reason)
+
+
+def _unavailable(reason: str) -> LiveEvidenceStatus:
+    return LiveEvidenceStatus(status="unavailable", reason=reason)
 
 
 def _should_augment_with_live_evidence(
@@ -245,65 +286,170 @@ def _should_augment_with_live_evidence(
     return datetime.now(UTC) - newest > _LIVE_EVIDENCE_FRESHNESS_WINDOW
 
 
-async def _gather_live_evidence(
-    session: AsyncSession, query: str, actor: Identity, retry_count: dict[str, int]
-) -> list[EvidenceItem]:
-    """Fetch fresh evidence directly from external APIs (GitHub, Slack),
-    scoped to `actor`'s organization's already-registered `connector_configs`
-    -- the live half of this module's hybrid design (see module docstring).
+_AUTH_FAILED = object()  # sentinel: an auth failure must not be retried
 
-    Resolves connector configs via `core.tenancy.service.list_connectors`
-    (never `app.ingestion`, which `agents/` may not import at all) and
-    dispatches each `status == "active"` one to the matching
-    `_LIVE_SOURCES[connector_config.source]`, if any. Each source's call is
-    retried per `call_with_retry`/logged-and-skipped on failure, exactly
-    like every other source in this module -- one connector's live lookup
-    failing (a bad token, a rate limit, a timeout) does not affect any
-    other connector's.
+
+async def _gather_live_evidence(
+    session: AsyncSession,
+    query: str,
+    actor: Identity,
+    retry_count: dict[str, int],
+    incident_id: uuid.UUID,
+) -> tuple[list[EvidenceItem], LiveEvidenceStatus]:
+    """Fetch fresh evidence directly from external APIs (GitHub, Slack) for
+    the incident `incident_id` -- the live half of this module's hybrid
+    design (see module docstring) -- and report exactly what happened.
+
+    Authorization and tenant isolation, in order:
+      1. The incident is loaded through `core.incidents.service.get_incident`
+         as `actor` (same-organization + `incident:read` on its project --
+         the same rule `triage_incident` applies). A caller who cannot read
+         the incident gets `unavailable` / `incident_not_authorized` and no
+         connector or token is ever touched.
+      2. Connectors come from `core.tenancy.service.
+         resolve_live_evidence_connectors`, which re-checks the same
+         permission, restricts to the actor's own organization, to active
+         connectors, and to org-wide or this incident's project, and decrypts
+         credentials in memory. `tenancy:manage` is deliberately NOT needed:
+         that gates *managing* connectors, not using them for an incident
+         the caller may already read. The public `list_connectors` (redacted,
+         `tenancy:manage`-gated) is untouched.
+
+    Every outcome is reported in the returned `LiveEvidenceStatus`: one
+    connector failing (bad token, rate limit, timeout) never affects
+    another's evidence, but is no longer invisible. Auth failures are not
+    retried; other failures are retried per `call_with_retry`. Nothing in the
+    status carries exception text or credentials.
     """
     try:
-        connector_configs = await tenancy_service.list_connectors(
-            session, actor, actor.organization_id
+        incident = await incidents_service.get_incident(
+            session, actor, actor.organization_id, incident_id
         )
+    except (PermissionDeniedError, NotFoundError):
+        return [], _unavailable("incident_not_authorized")
     except Exception as exc:
-        logger.warning("investigation_evidence_source_failed", source="live", error=str(exc))
-        return []
+        logger.warning(
+            "investigation_live_incident_lookup_failed", error_type=type(exc).__name__
+        )
+        return [], _unavailable("incident_lookup_failed")
+
+    implemented_sources = {
+        name for name, source in _LIVE_SOURCES.items() if getattr(source, "implemented", True)
+    }
+    stub_sources = set(_LIVE_SOURCES) - implemented_sources
+
+    try:
+        resolution = await tenancy_service.resolve_live_evidence_connectors(
+            session,
+            actor,
+            actor.organization_id,
+            incident_organization_id=incident.organization_id,
+            incident_project_id=incident.project_id,
+            sources=implemented_sources,
+            not_implemented_sources=stub_sources,
+        )
+    except PermissionDeniedError:
+        return [], _unavailable("not_authorized")
+    except Exception as exc:
+        logger.warning(
+            "investigation_live_connector_lookup_failed", error_type=type(exc).__name__
+        )
+        return [], _unavailable("connector_lookup_failed")
+
+    if not resolution.credentials and not resolution.skipped:
+        return [], _unavailable("no_live_connectors")
 
     since = datetime.now(UTC) - timedelta(
         hours=get_settings().investigation_live_evidence_lookback_hours
     )
 
+    outcomes: list[LiveSourceOutcome] = [
+        LiveSourceOutcome(
+            source=skip.source,
+            connector_config_id=skip.connector_config_id,
+            outcome="not_implemented" if skip.reason == "not_implemented" else "skipped",
+            reason=skip.reason,
+        )
+        for skip in resolution.skipped
+    ]
     evidence: list[EvidenceItem] = []
-    for connector_config in connector_configs:
-        if connector_config.status != "active":
-            continue
-        live_source = _LIVE_SOURCES.get(connector_config.source)
-        if live_source is None:
-            continue
+    for connector in resolution.credentials:
+        live_source = _LIVE_SOURCES[connector.source]
+
+        async def attempt(live_source=live_source, connector=connector):
+            try:
+                return await live_source.fetch_live_evidence(
+                    connector=connector,
+                    query=query,
+                    since=since,
+                    limit=_PER_SOURCE_TOP_K,
+                )
+            except LiveSourceAuthError:
+                return _AUTH_FAILED
 
         try:
-            items = await call_with_retry(
-                f"investigation_agent.evidence.live.{connector_config.source}",
-                lambda live_source=live_source, connector_config=connector_config: (
-                    live_source.fetch_live_evidence(
-                        connector_config=connector_config,
-                        query=query,
-                        since=since,
-                        limit=_PER_SOURCE_TOP_K,
-                    )
-                ),
+            result = await call_with_retry(
+                f"investigation_agent.evidence.live.{connector.source}",
+                attempt,
                 retry_count=retry_count,
             )
         except Exception as exc:
             logger.warning(
                 "investigation_evidence_source_failed",
-                source=f"live_{connector_config.source}",
-                error=str(exc),
+                source=f"live_{connector.source}",
+                error_type=type(exc).__name__,
+            )
+            outcomes.append(
+                LiveSourceOutcome(
+                    source=connector.source,
+                    connector_config_id=connector.connector_config_id,
+                    outcome="error",
+                    reason="lookup_failed",
+                )
             )
             continue
-        evidence.extend(items)
 
-    return evidence
+        if result is _AUTH_FAILED:
+            logger.warning(
+                "investigation_live_credential_rejected",
+                source=connector.source,
+                connector_config_id=str(connector.connector_config_id),
+            )
+            outcomes.append(
+                LiveSourceOutcome(
+                    source=connector.source,
+                    connector_config_id=connector.connector_config_id,
+                    outcome="auth_failed",
+                    reason="auth_failed",
+                )
+            )
+            continue
+
+        evidence.extend(result)
+        outcomes.append(
+            LiveSourceOutcome(
+                source=connector.source,
+                connector_config_id=connector.connector_config_id,
+                outcome="ok",
+                items_returned=len(result),
+            )
+        )
+
+    # Placeholder sources are listed but never counted as a success or a
+    # failure -- they did not run.
+    counted = [outcome for outcome in outcomes if outcome.outcome != "not_implemented"]
+    if not counted:
+        return [], LiveEvidenceStatus(
+            status="unavailable", reason="no_implemented_live_sources", sources=outcomes
+        )
+    succeeded = sum(1 for outcome in counted if outcome.outcome == "ok")
+    if succeeded == len(counted):
+        overall = "ok"
+    elif succeeded:
+        overall = "partial"
+    else:
+        overall = "failed"
+    return evidence, LiveEvidenceStatus(status=overall, sources=outcomes)
 
 
 async def _gather_code_evidence(

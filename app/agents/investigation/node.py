@@ -54,12 +54,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.graph import GraphState
 from app.agents.investigation import critique as critique_module
-from app.agents.investigation.evidence import gather_evidence
+from app.agents.investigation.evidence import gather_evidence_with_status
 from app.agents.investigation.hypothesis import generate_hypotheses
 from app.agents.retry import call_with_retry
 from app.core.incidents import service as incidents_service
 from app.shared.config.logging import get_logger
-from app.shared.schemas import AskResponse, InvestigationResult
+from app.shared.schemas import AskResponse, InvestigationResult, LiveEvidenceStatus
 
 logger = get_logger(__name__)
 
@@ -68,6 +68,16 @@ _NO_EVIDENCE_NEXT_STEPS = [
     "postmortems. Recommend manual investigation starting with recent "
     "deploys and on-call escalation."
 ]
+# Appended to `suggested_next_steps` when live GitHub/Slack evidence was
+# expected to be available but was not (fully) collected, so a reader knows
+# the evidence set may be missing very recent activity. Not added for a
+# deliberate non-attempt (kill switch, no incident) or for an org that simply
+# has no live connectors -- those are configuration, not a problem to flag.
+_LIVE_EVIDENCE_INCOMPLETE_NOTE = (
+    "Live GitHub/Slack evidence could not be fully collected for this "
+    "investigation (see `live_evidence`); recent activity may be missing "
+    "from the evidence below. Check the affected connectors."
+)
 _NO_HYPOTHESIS_NEXT_STEPS = [
     "Evidence was gathered but no well-supported root-cause hypothesis "
     "could be generated automatically. Recommend manual review of the "
@@ -83,7 +93,7 @@ def make_investigation_agent_node(
     """
 
     async def node(state: GraphState) -> dict[str, Any]:
-        evidence = await gather_evidence(
+        evidence, live_status = await gather_evidence_with_status(
             session,
             query=state.query,
             actor=state.actor,
@@ -99,7 +109,8 @@ def make_investigation_agent_node(
                     evidence=[],
                     hypotheses=[],
                     suggested_owner_team=None,
-                    suggested_next_steps=_NO_EVIDENCE_NEXT_STEPS,
+                    suggested_next_steps=_with_live_note(_NO_EVIDENCE_NEXT_STEPS, live_status),
+                    live_evidence=live_status,
                 ),
             )
             await _attach_to_timeline(session, state, result)
@@ -142,11 +153,12 @@ def make_investigation_agent_node(
                 evidence=evidence,
                 hypotheses=review.hypotheses,
                 suggested_owner_team=review.suggested_owner_team,
-                suggested_next_steps=review.suggested_next_steps,
+                suggested_next_steps=_with_live_note(review.suggested_next_steps, live_status),
                 review_status=review.review_status,
                 critique_verdict=review.critique_verdict,
                 revision_count=review.revision_count,
                 critique_issues=review.critique_issues,
+                live_evidence=live_status,
             ),
         )
         await _attach_to_timeline(session, state, result)
@@ -158,6 +170,19 @@ def make_investigation_agent_node(
         }
 
     return node
+
+
+def _with_live_note(next_steps: list[str], live_status: LiveEvidenceStatus) -> list[str]:
+    """`next_steps` plus `_LIVE_EVIDENCE_INCOMPLETE_NOTE` when live evidence
+    was attempted and failed in whole or part, or was unavailable for a
+    reason other than configuration ("this org has no live connectors" or
+    "only not-yet-implemented live sources").
+    """
+    incomplete = live_status.status in ("failed", "partial") or (
+        live_status.status == "unavailable"
+        and live_status.reason not in ("no_live_connectors", "no_implemented_live_sources")
+    )
+    return [*next_steps, _LIVE_EVIDENCE_INCOMPLETE_NOTE] if incomplete else list(next_steps)
 
 
 async def _attach_to_timeline(session: AsyncSession, state: GraphState, result: AskResponse) -> None:

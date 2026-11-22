@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import { useToast } from "@/context/ToastContext";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import type { ApiError } from "@/types/common";
+import { CheckEmailPanel } from "./CheckEmailPanel";
 
 /**
  * `/invitations/:invitationId/accept?token=...` -- `invitationId` names
@@ -19,10 +20,15 @@ export function AcceptInvitationPage() {
   const token = searchParams.get("token") ?? "";
   const { acceptInvitation } = useAuth();
   const { toast } = useToast();
-  const navigate = useNavigate();
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // Accepting only STARTS acceptance: the invitation token is visible to the
+  // inviting admin, so it is not proof of mailbox control. The server emails a
+  // confirmation link to the invited address and finishes the acceptance when
+  // it is opened -- no session is issued here.
+  const [started, setStarted] = useState(false);
+  const [accountExists, setAccountExists] = useState(false);
 
   if (!invitationId || !token) {
     return (
@@ -40,14 +46,37 @@ export function AcceptInvitationPage() {
     setIsSubmitting(true);
     try {
       await acceptInvitation(invitationId!, { token, password, displayName: displayName || undefined });
-      navigate("/ask");
+      setStarted(true);
     } catch (err) {
       const apiError = err as ApiError;
+      if (apiError?.errorCode === "invitation.account_exists") {
+        setAccountExists(true);
+        return;
+      }
       const message = apiError?.message || "This invitation link may be invalid, expired, or already used.";
       toast({ variant: "error", title: "Couldn't accept invitation", description: message });
     } finally {
       setIsSubmitting(false);
     }
+  }
+
+  if (started) {
+    return <CheckEmailPanel purpose="finish accepting your invitation" />;
+  }
+
+  if (accountExists) {
+    return (
+      <div className="glass-panel rounded-2xl px-6 py-6 text-center">
+        <h1 className="mb-2 text-lg font-semibold text-ink">You already have an account</h1>
+        <p className="mb-5 text-sm text-ink-muted">
+          An account already exists for the invited email address, so this link can&apos;t create a
+          new one. Sign in with your existing account instead.
+        </p>
+        <Link to="/login" className="text-sm font-medium text-accent hover:underline">
+          Go to sign in
+        </Link>
+      </div>
+    );
   }
 
   return (

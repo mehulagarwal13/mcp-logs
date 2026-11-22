@@ -121,6 +121,7 @@ def _valid_claims(**overrides):
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=5)).timestamp()),
         "email": "person@example.test",
+        "email_verified": True,
         "name": "Test Person",
         "groups": ["engineering", "operators"],
     }
@@ -420,7 +421,7 @@ async def test_exchange_rejects_invalid_standard_claims(
 async def test_exchange_rejects_missing_email_claim(monkeypatch, sso_config) -> None:
     claims = _valid_claims()
     del claims["email"]
-    with pytest.raises(PermissionDeniedError, match="verified email claim"):
+    with pytest.raises(PermissionDeniedError, match="did not provide an email claim"):
         await _exchange_signed_token(monkeypatch, sso_config, claims=claims)
 
 
@@ -437,16 +438,143 @@ async def test_exchange_currently_accepts_missing_issued_at_claim(monkeypatch, s
 
 
 @pytest.mark.asyncio
-async def test_exchange_currently_trusts_email_without_verified_email_claim(
-    monkeypatch, sso_config
-) -> None:
+async def test_exchange_rejects_email_the_idp_marked_unverified(monkeypatch, sso_config) -> None:
+    """REVERSAL of `test_exchange_currently_trusts_email_without_verified_email_claim`,
+    which pinned the vulnerability: an ID token with `email_verified=False` used
+    to be accepted and its email trusted for invitation matching, domain rules
+    and account linking. It must now be rejected outright."""
     claims = _valid_claims(email_verified=False)
 
-    result, _ = await _exchange_signed_token(monkeypatch, sso_config, claims=claims)
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await _exchange_signed_token(monkeypatch, sso_config, claims=claims)
 
-    # Provisioning can match invitations/domains using this email, but the
-    # current VerifiedIdPClaims contract drops email_verified and trusts it.
+    assert exc_info.value.error_code == "auth.idp_email_not_verified"
+
+
+@pytest.mark.asyncio
+async def test_exchange_rejects_missing_email_verified_claim(monkeypatch, sso_config) -> None:
+    """A missing claim is NOT interpreted as true."""
+    claims = _valid_claims()
+    del claims["email_verified"]
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await _exchange_signed_token(monkeypatch, sso_config, claims=claims)
+
+    assert exc_info.value.error_code == "auth.idp_email_not_verified"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_value",
+    ["true", "True", "1", 1, "yes", None, [], {}, 0],
+    ids=["str-true", "str-True", "str-1", "int-1", "str-yes", "null", "list", "dict", "int-0"],
+)
+async def test_exchange_rejects_non_boolean_email_verified_claim(
+    monkeypatch, sso_config, bad_value
+) -> None:
+    """Strict typing: only a JSON boolean `true` is evidence. `"true"` (some
+    IdPs / misconfigured mappers emit strings) and `1` are rejected, not coerced."""
+    claims = _valid_claims(email_verified=bad_value)
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await _exchange_signed_token(monkeypatch, sso_config, claims=claims)
+
+    assert exc_info.value.error_code == "auth.idp_email_not_verified"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_email", [None, "", "   ", 123, ["a@b.test"]])
+async def test_exchange_rejects_missing_or_non_string_email(monkeypatch, sso_config, bad_email) -> None:
+    claims = _valid_claims(email=bad_email)
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await _exchange_signed_token(monkeypatch, sso_config, claims=claims)
+
+    assert exc_info.value.error_code == "auth.idp_response_invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["okta", "auth0", "google_workspace"])
+async def test_exchange_accepts_standard_email_verified_true_for_standard_oidc_providers(
+    monkeypatch, sso_config, provider
+) -> None:
+    config = sso_config.model_copy(update={"provider": provider})
+
+    result, _ = await _exchange_signed_token(monkeypatch, config)
+
+    assert result.email_verified is True
+    assert result.email_verification_source == "email_verified"
     assert result.email == "person@example.test"
+
+
+@pytest.mark.asyncio
+async def test_entra_without_any_ownership_evidence_is_rejected(monkeypatch, sso_config) -> None:
+    """Microsoft Entra ID does not emit `email_verified` by default and its
+    `email` claim is mutable/unverified: with neither `email_verified` nor
+    `xms_edov` the address must not be trusted."""
+    config = sso_config.model_copy(update={"provider": "entra_id"})
+    claims = _valid_claims()
+    del claims["email_verified"]
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await _exchange_signed_token(monkeypatch, config, claims=claims)
+
+    assert exc_info.value.error_code == "auth.idp_email_not_verified"
+
+
+@pytest.mark.asyncio
+async def test_entra_accepts_xms_edov_true_as_ownership_evidence(monkeypatch, sso_config) -> None:
+    config = sso_config.model_copy(update={"provider": "entra_id"})
+    claims = _valid_claims(xms_edov=True)
+    del claims["email_verified"]
+
+    result, _ = await _exchange_signed_token(monkeypatch, config, claims=claims)
+
+    assert result.email_verified is True
+    assert result.email_verification_source == "xms_edov"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_value", [False, "true", 1, None])
+async def test_entra_xms_edov_must_be_a_true_boolean(monkeypatch, sso_config, bad_value) -> None:
+    config = sso_config.model_copy(update={"provider": "entra_id"})
+    claims = _valid_claims(xms_edov=bad_value)
+    del claims["email_verified"]
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await _exchange_signed_token(monkeypatch, config, claims=claims)
+
+    assert exc_info.value.error_code == "auth.idp_email_not_verified"
+
+
+@pytest.mark.asyncio
+async def test_xms_edov_is_only_honoured_for_entra(monkeypatch, sso_config) -> None:
+    """`xms_edov` is a Microsoft claim: another provider asserting it (or an
+    attacker-influenced custom claim of that name) is not evidence."""
+    claims = _valid_claims(xms_edov=True)
+    del claims["email_verified"]
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await _exchange_signed_token(monkeypatch, sso_config, claims=claims)  # provider=okta
+
+    assert exc_info.value.error_code == "auth.idp_email_not_verified"
+
+
+@pytest.mark.asyncio
+async def test_unverified_email_still_fails_before_it_can_reach_provisioning(monkeypatch, sso_config) -> None:
+    """Signature/issuer/audience/expiry checks are unchanged AND still come first:
+    a forged token with email_verified=true is rejected by signature verification,
+    not accepted on the strength of its claim."""
+    other_key = _new_signing_key()
+    claims = _valid_claims(email_verified=True)
+    with pytest.raises(PermissionDeniedError, match="signature or claims verification failed"):
+        await _exchange_signed_token(
+            monkeypatch,
+            sso_config,
+            claims=claims,
+            signing_key=other_key,
+            jwks={"keys": [_new_signing_key()[1]]},
+        )
 
 
 @pytest.mark.asyncio

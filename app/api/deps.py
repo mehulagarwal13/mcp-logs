@@ -45,6 +45,7 @@ from app.core.auth import service as auth_service
 from app.core.exceptions import PermissionDeniedError, ServiceUnavailableError
 from app.core.users import service as users_service
 from app.database.session import get_db_session, set_tenant_context
+from app.shared.email import email_delivery_configured
 from app.shared.schemas import Identity
 
 DbSession = Annotated[AsyncSession, Depends(get_db_session)]
@@ -149,3 +150,16 @@ async def get_current_identity(
 
 
 CurrentIdentity = Annotated[Identity, Depends(get_current_identity)]
+
+
+async def require_email_delivery() -> None:
+    """Fail every caller -- identically, before looking at the request -- with
+    503 when no email provider is configured, instead of recording pending
+    registrations nobody can verify. Because it never inspects the submitted
+    address, the status reveals nothing about any account. (Production cannot
+    reach this state: `Settings` refuses to boot without email configured.)"""
+    if not email_delivery_configured():
+        raise ServiceUnavailableError(
+            "Email delivery is not configured, so email verification is unavailable.",
+            error_code="email.not_configured",
+        )

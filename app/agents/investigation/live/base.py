@@ -18,17 +18,18 @@ long-term fetch-clean-chunk-embed-store pipeline; a `LiveEvidenceSource`
 only ever produces `EvidenceItem`s directly, never a `RawDocument`, and
 never writes anything to `documents`/`document_metadata`/any chunk table.
 
-Every live source is handed the already-resolved `ConnectorConfig`
-(`app.core.tenancy.schemas.ConnectorConfig` -- core/tenancy's own read
-model, not ingestion's `app.ingestion.schemas.ResolvedConnectorConfig`) for
-the specific connector it's querying, so it can read
-`connector_config.credential_ref` / `connector_config.config` (repos,
-channels, ...) the same way the equivalent ingestion connector does,
-without `agents/` needing to know anything about `app.ingestion`'s internal
-shapes. `agents.investigation.evidence._gather_live_evidence` is the only
-caller that resolves which `ConnectorConfig` rows exist (via
-`core.tenancy.service.list_connectors`) and dispatches to the matching
-`LiveEvidenceSource` by `connector_config.source`.
+Every live source is handed a `LiveConnectorCredential`
+(`app.core.tenancy.live_credentials` -- core/tenancy's internal carrier for a
+connector whose credential has been decrypted in memory) for the specific
+connector it's querying. Read the token with `connector.reveal_token()` only
+when building the outbound request, and the non-secret settings (repos,
+channels, ...) from `connector.config`. NOT the public `ConnectorConfig`:
+that one is always redacted (its `credential_ref` is a placeholder), which is
+exactly why live lookups used to authenticate with a bogus token.
+`agents.investigation.evidence._gather_live_evidence` is the only caller that
+resolves connectors (via `core.tenancy.service.
+resolve_live_evidence_connectors`, which enforces tenant isolation and
+incident-read authorization) and dispatches by `connector.source`.
 """
 
 from __future__ import annotations
@@ -36,8 +37,22 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-from app.core.tenancy.schemas import ConnectorConfig
+from app.core.tenancy.live_credentials import LiveConnectorCredential
 from app.shared.schemas import EvidenceItem
+
+
+class LiveSourceError(Exception):
+    """A live lookup failed as a whole (every request failed). Messages must be
+    generic: they are never shown to callers, but must still never carry a
+    credential or provider response body.
+    """
+
+
+class LiveSourceAuthError(LiveSourceError):
+    """The provider rejected the connector's credential (revoked, expired, or
+    invalid). Not worth retrying; surfaced as `auth_failed` in the
+    investigation's `LiveEvidenceStatus`.
+    """
 
 
 @runtime_checkable
@@ -47,11 +62,16 @@ class LiveEvidenceSource(Protocol):
     """
 
     source_name: str
+    # False for a placeholder that has no real backend yet. Such a source is
+    # never called and its connectors' credentials are never decrypted; the
+    # investigation reports it as `not_implemented` rather than as a success.
+    # Optional: a source that does not define it is treated as implemented.
+    implemented: bool
 
     async def fetch_live_evidence(
         self,
         *,
-        connector_config: ConnectorConfig,
+        connector: LiveConnectorCredential,
         query: str,
         since: datetime,
         limit: int,
@@ -75,8 +95,12 @@ class LiveEvidenceSource(Protocol):
         `agents.investigation.evidence`'s module docstring already applies
         to every other evidence source. It is acceptable to let a *total*
         failure (e.g. an invalid credential) raise, since the caller already
-        wraps every `fetch_live_evidence` call in `agents.retry.
-        call_with_retry` plus its own try/except, exactly like every other
-        source in this module.
+        wraps every `fetch_live_evidence` call in its own try/except, exactly
+        like every other source in this module.
+
+        Raise `LiveSourceAuthError` when the provider rejects the credential,
+        and `LiveSourceError` when every request failed -- never return `[]`
+        for those, or a broken connector is indistinguishable from "nothing
+        relevant found".
         """
         ...

@@ -15,6 +15,8 @@ from app.shared.schemas.agent_contracts import (
     EvidenceItem,
     GapReport,
     InvestigationResult,
+    LiveEvidenceStatus,
+    LiveSourceOutcome,
     RootCauseHypothesis,
 )
 from app.shared.schemas.common import (
@@ -44,6 +46,8 @@ __all__ = [
     "IncidentStatus",
     "IngestionJobStatus",
     "InvestigationResult",
+    "LiveEvidenceStatus",
+    "LiveSourceOutcome",
     "PostmortemStatus",
     "RootCauseHypothesis",
     "Severity",

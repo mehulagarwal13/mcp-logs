@@ -84,3 +84,29 @@ export interface InvitationAcceptPayload {
   password: string;
   displayName?: string;
 }
+
+// Email verification (docs/security/email-verification-*.md). The backend is
+// the only source of truth: nothing below is ever treated as proof of
+// verification until a `verifyEmail` call actually resolved successfully.
+
+// Generic acknowledgement for signup, invitation acceptance and resend. It is
+// deliberately identical whether or not a message was really sent (so the
+// endpoints cannot be used to enumerate accounts) -- never infer from it that
+// an address is registered or unregistered.
+export interface VerificationRequested {
+  status: "verification_sent";
+  message: string;
+}
+
+export interface VerifyEmailResult {
+  status: "verified";
+}
+
+// `ApiError.errorCode` values the verification UI branches on.
+export type EmailVerificationErrorCode =
+  | "email_verification.invalid"
+  | "email_verification.expired"
+  | "email_verification.already_used"
+  | "auth.email_not_verified"
+  | "invitation.account_exists"
+  | "email.not_configured";

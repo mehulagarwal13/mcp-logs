@@ -86,5 +86,18 @@ class UserCredentialLookup(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     user_id: uuid.UUID
+    email_verified_at: datetime | None = None
     password_hash: str | None
     is_active: bool
+
+class UserEmailState(BaseModel):
+    """Narrow view of a user's email-ownership state for the verification
+    service -- never a raw ORM row, never the password hash."""
+
+    model_config = ConfigDict(frozen=True)
+
+    user_id: uuid.UUID
+    email: str
+    email_verified_at: datetime | None
+    is_active: bool
+    has_password: bool

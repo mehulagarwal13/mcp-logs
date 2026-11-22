@@ -16,13 +16,19 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.agents import service as agents_service
 from app.agents.schemas import AgentExecution
 from app.api.deps import CurrentIdentity, DbSession
 from app.api.rate_limit import rate_limit_by_user
-from app.retrieval.schemas import CollectionName, ScoredChunk
+from app.retrieval.schemas import (
+    DEFAULT_TOP_K,
+    MAX_TOP_K,
+    MIN_TOP_K,
+    CollectionName,
+    ScoredChunk,
+)
 from app.shared.schemas import AskResponse
 
 router = APIRouter(tags=["ask"])
@@ -81,7 +87,9 @@ async def investigate_incident(
 
 class SimilarIncidentsRequest(BaseModel):
     description: str
-    top_k: int = 10
+    # Bounded: an unbounded `top_k` reached the vector store's LIMIT directly
+    # (see `app.retrieval.schemas.MAX_TOP_K`). Out of range -> HTTP 422.
+    top_k: int = Field(default=DEFAULT_TOP_K, ge=MIN_TOP_K, le=MAX_TOP_K)
 
 
 @router.post(
@@ -104,7 +112,7 @@ async def search_similar_incidents(
 class RecentChangesRequest(BaseModel):
     query: str
     since: datetime | None = None
-    top_k: int = 10
+    top_k: int = Field(default=DEFAULT_TOP_K, ge=MIN_TOP_K, le=MAX_TOP_K)
     # `None` (the default) matches `agents_service.search_recent_changes`'s
     # own default -- see that function's docstring: it searches both
     # "documentation" (commit/PR/issue content, which has no file

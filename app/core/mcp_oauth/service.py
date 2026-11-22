@@ -16,11 +16,13 @@ presents its client_id at `/token`.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.mcp_oauth import repository
+from app.shared.config.settings import get_settings
 from app.shared.security import decrypt_secret, encrypt_secret, get_kms
 
 #: `OAuthClientInformationFull` fields carried on `OAuthClient` as their own
@@ -48,13 +50,28 @@ async def get_registered_client(session: AsyncSession, client_id: str) -> dict[s
     if row.client_secret_encrypted is not None:
         client_secret = await decrypt_secret(get_kms(), row.client_secret_encrypted)
 
+    secret_expires_at = row.client_secret_expires_at
+    if client_secret is not None and not secret_expires_at:
+        # Registered before secrets expired (stored as 0 = "never"): hold it to
+        # the same window as a new registration, counted from when it was
+        # issued. Nothing recorded about when => treat as already expired.
+        issued_at = row.client_id_issued_at
+        window = get_settings().mcp_oauth_client_secret_expiry_days * 86400
+        secret_expires_at = issued_at + window if issued_at else 1
+
     return {
         **row.client_metadata,
         "client_id": row.client_id,
         "client_id_issued_at": row.client_id_issued_at,
         "client_secret": client_secret,
-        "client_secret_expires_at": row.client_secret_expires_at,
+        "client_secret_expires_at": secret_expires_at,
     }
+
+
+async def count_recent_registrations(session: AsyncSession, *, within_seconds: int) -> int:
+    """How many clients were registered in the trailing `within_seconds`."""
+    since = datetime.now(UTC) - timedelta(seconds=within_seconds)
+    return await repository.count_oauth_clients_created_since(session, since)
 
 
 async def register_oauth_client(session: AsyncSession, client_info: dict[str, Any]) -> None:

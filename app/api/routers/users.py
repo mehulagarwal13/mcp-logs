@@ -108,10 +108,15 @@ async def execute_user_data_deletion(
     """Delete/anonymize this user's own data within the caller's
     organization, retaining organization-owned knowledge and history.
 
-    Safe to retry: the operation is idempotent, and a repeat run reports
-    `was_noop=true` with zero-row steps rather than failing. Inspect
-    `status` -- `partially_completed` and `failed` are both real outcomes
-    and neither means the person's data is fully gone.
+    Refused when: the target is not a current member of the caller's
+    organization (404, indistinguishable from a nonexistent user), the target
+    is the caller (400 `privacy.cannot_delete_self`), or the target is the
+    organization's last admin (409 `org.last_admin`). A person who also
+    belongs to other organizations keeps their global account; only this
+    organization's access and data are removed. Once a run has removed the
+    person's roles, repeating it returns 404 (they are no longer a member).
+    Inspect `status` -- `partially_completed` and `failed` are both real
+    outcomes and neither means the person's data is fully gone.
 
     Deliberately not a `DELETE` verb: this does not remove a `users` row
     (three `ON DELETE RESTRICT` foreign keys make that impossible -- see

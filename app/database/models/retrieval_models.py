@@ -31,6 +31,19 @@ def _base_chunk_table_args(table: str) -> tuple:
         UniqueConstraint("document_id", "chunk_index", name=f"uq_{table}_document_chunk_index"),
         Index(f"ix_{table}_org_project", "organization_id", "project_id"),
         Index(f"ix_{table}_content_tsv", "content_tsv", postgresql_using="gin"),
+        # Approximate-nearest-neighbour index for dense retrieval. The operator
+        # class MUST match the query operator: `PgVectorStore` orders by
+        # `embedding <#> :q` (negative inner product; embeddings are
+        # L2-normalized), which only `vector_ip_ops` serves -- `vector_cosine_ops`
+        # would never be used. Created by migration `b7c1d9e4f2a3` (CONCURRENTLY,
+        # pgvector >= 0.8.0); declared here so `alembic check` sees no drift.
+        Index(
+            f"ix_{table}_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 128},
+            postgresql_ops={"embedding": "vector_ip_ops"},
+        ),
     )
 
 

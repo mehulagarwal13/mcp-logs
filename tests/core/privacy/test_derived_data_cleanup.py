@@ -61,7 +61,11 @@ class _CapturingSession:
         self.statements: list[object] = []
 
     async def execute(self, statement, *args, **kwargs):
-        self.statements.append(statement)
+        # The store issues one transaction-scoped settings statement
+        # (HNSW/plan-cache `set_config`) before each vector query; it is not
+        # the SELECT these tests inspect, so it is not recorded.
+        if "plan_cache_mode" not in str(statement):
+            self.statements.append(statement)
         return _EmptyResult()
 
     async def flush(self):  # pragma: no cover - not exercised here
@@ -115,6 +119,81 @@ async def test_lexical_search_excludes_soft_deleted_documents(collection, filter
     assert "documents.deleted_atisnull" in sql, (
         f"lexical search on {collection!r} does not exclude soft-deleted documents"
     )
+
+
+# --- query-time exclusion of superseded document versions -----------------
+#
+# `documents.superseded_at` marks an older version of a re-synced connector
+# document. All FOUR retrieval queries (dense/lexical, single-collection and
+# all-collections) must exclude it independently -- fusing a filtered list
+# with an unfiltered one would reintroduce stale content, exactly as with
+# `deleted_at` above. "incidents" is included here deliberately: it is only
+# reachable through the single-collection methods.
+
+_ALL_FOUR_COLLECTIONS = ["documentation", "code", "conversations", "incidents"]
+_PREDICATE = "documents.superseded_atisnull"
+
+
+def _normalized(stmt) -> str:
+    return _compile_structure(stmt).lower().replace(" ", "")
+
+
+@pytest.mark.parametrize("collection", _ALL_FOUR_COLLECTIONS)
+@pytest.mark.asyncio
+async def test_dense_search_excludes_superseded_documents(collection, filters):
+    session = _CapturingSession()
+
+    await PgVectorStore().search(session, collection, [0.1] * 384, filters, top_k=5)
+
+    assert _PREDICATE in _normalized(session.statements[0]), (
+        f"dense search on {collection!r} would return superseded versions"
+    )
+
+
+@pytest.mark.parametrize("collection", _ALL_FOUR_COLLECTIONS)
+@pytest.mark.asyncio
+async def test_lexical_search_excludes_superseded_documents(collection, filters):
+    session = _CapturingSession()
+
+    await PgVectorStore().lexical_search(session, collection, "connection pool", filters, top_k=5)
+
+    assert _PREDICATE in _normalized(session.statements[0]), (
+        f"lexical search on {collection!r} would return superseded versions"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_all_excludes_superseded_documents_in_every_branch(filters):
+    session = _CapturingSession()
+
+    await PgVectorStore().search_all(session, [0.1] * 384, filters, top_k=5)
+
+    sql = _normalized(session.statements[0])
+    # One UNION ALL branch per all-collections-default collection (3).
+    assert sql.count(_PREDICATE) == 3
+
+
+@pytest.mark.asyncio
+async def test_lexical_search_all_excludes_superseded_documents_in_every_branch(filters):
+    session = _CapturingSession()
+
+    await PgVectorStore().lexical_search_all(session, "connection pool", filters, top_k=5)
+
+    sql = _normalized(session.statements[0])
+    assert sql.count(_PREDICATE) == 3
+
+
+@pytest.mark.asyncio
+async def test_superseded_filter_coexists_with_tenant_acl_and_deleted_filters(filters):
+    session = _CapturingSession()
+
+    await PgVectorStore().search(session, "documentation", [0.1] * 384, filters, top_k=5)
+
+    sql = _normalized(session.statements[0])
+    assert _PREDICATE in sql
+    assert "documents.deleted_atisnull" in sql
+    assert "organization_id" in sql
+    assert "acl_permission_code" in sql
 
 
 @pytest.mark.asyncio
@@ -230,6 +309,7 @@ async def test_rejecting_a_document_purges_chunks_from_every_collection(monkeypa
         ("documentation", document_id),
         ("code", document_id),
         ("conversations", document_id),
+        ("incidents", document_id),
     ]
 
 
@@ -253,6 +333,47 @@ async def test_chunk_purge_is_idempotent_across_collections(monkeypatch):
         sql = _compile(statement).lower()
         assert sql.startswith("delete from documentation_chunks")
 
-    # And the service-level sweep reports every collection it covered.
+    # And the service-level sweep reports every collection it covered --
+    # including "incidents", which the sweep used to silently skip.
     purged = await knowledge_service._purge_document_chunks(session, document_id)
-    assert purged == ["documentation", "code", "conversations"]
+    assert purged == ["documentation", "code", "conversations", "incidents"]
+
+
+@pytest.mark.asyncio
+async def test_delete_document_sweeps_all_four_chunk_tables_scoped_by_document():
+    """`retrieval.service.delete_document` must issue one DELETE per chunk
+    table -- all four, `incidents_chunks` included -- each constrained to the
+    given document id (never an unscoped delete)."""
+    from app.retrieval import service as retrieval_service
+
+    session = _CapturingSession()
+    document_id = uuid.uuid4()
+
+    swept = await retrieval_service.delete_document(session, document_id)
+
+    assert swept == ["documentation", "code", "conversations", "incidents"]
+    tables = []
+    for statement in session.statements:
+        sql = _compile(statement).lower()
+        assert sql.startswith("delete from ")
+        assert "document_id" in sql and document_id.hex in sql.replace("-", "")
+        tables.append(sql.split()[2])
+    assert tables == [
+        "documentation_chunks",
+        "code_chunks",
+        "conversations_chunks",
+        "incidents_chunks",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delete_document_is_idempotent():
+    from app.retrieval import service as retrieval_service
+
+    session = _CapturingSession()
+    document_id = uuid.uuid4()
+
+    await retrieval_service.delete_document(session, document_id)
+    await retrieval_service.delete_document(session, document_id)
+
+    assert len(session.statements) == 8  # 4 tables x 2 calls, no errors

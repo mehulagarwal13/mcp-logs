@@ -8,8 +8,9 @@ from typing import Any
 
 import pytest
 
+from app.agents.investigation.live.base import LiveSourceAuthError, LiveSourceError
 from app.agents.investigation.live.slack_live import SlackLiveSource
-from app.core.tenancy.schemas import ConnectorConfig
+from app.core.tenancy.live_credentials import LiveConnectorCredential
 
 
 class _FakeResponse:
@@ -40,19 +41,17 @@ class _FakeHttpClient:
         return _FakeResponse(payload)
 
 
-def _connector_config(channels: list[str]) -> ConnectorConfig:
-    now = datetime.now(timezone.utc)
-    return ConnectorConfig(
-        id=uuid.uuid4(),
+_TOKEN = "xoxb-test-token-SECRET"
+
+
+def _connector_config(channels: list[str]) -> LiveConnectorCredential:
+    return LiveConnectorCredential(
+        connector_config_id=uuid.uuid4(),
         organization_id=uuid.uuid4(),
         project_id=None,
         source="slack",
-        credential_ref="xoxb-test-token",
         config={"channels": channels},
-        status="active",
-        last_synced_at=None,
-        created_at=now,
-        updated_at=now,
+        token=_TOKEN,
     )
 
 
@@ -62,7 +61,7 @@ async def test_fetch_live_evidence_returns_empty_without_channels() -> None:
     connector_config = _connector_config([])
 
     result = await source.fetch_live_evidence(
-        connector_config=connector_config,
+        connector=connector_config,
         query="checkout failing",
         since=datetime.now(timezone.utc),
         limit=5,
@@ -90,7 +89,7 @@ async def test_fetch_live_evidence_filters_by_keyword_and_flags_live(monkeypatch
     )
 
     result = await source.fetch_live_evidence(
-        connector_config=connector_config,
+        connector=connector_config,
         query="checkout 500 error",
         since=datetime(2026, 7, 1, tzinfo=timezone.utc),
         limit=5,
@@ -106,25 +105,71 @@ async def test_fetch_live_evidence_filters_by_keyword_and_flags_live(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_fetch_live_evidence_handles_slack_api_error(monkeypatch) -> None:
+async def test_invalid_auth_raises_auth_error_without_leaking_token(monkeypatch) -> None:
     source = SlackLiveSource()
     connector_config = _connector_config(["C0123456"])
 
-    payload = {"ok": False, "error": "invalid_auth"}
-    fake_http = _FakeHttpClient({"conversations.history": payload})
+    fake_http = _FakeHttpClient({"conversations.history": {"ok": False, "error": "invalid_auth"}})
+    monkeypatch.setattr(
+        "app.agents.investigation.live.slack_live.httpx.AsyncClient",
+        lambda *args, **kwargs: fake_http,
+    )
+
+    with pytest.raises(LiveSourceAuthError) as excinfo:
+        await source.fetch_live_evidence(
+            connector=connector_config,
+            query="checkout",
+            since=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            limit=5,
+        )
+    assert _TOKEN not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_every_channel_failing_for_a_non_auth_reason_raises_source_error(monkeypatch) -> None:
+    source = SlackLiveSource()
+    connector_config = _connector_config(["C1", "C2"])
+
+    fake_http = _FakeHttpClient({"conversations.history": {"ok": False, "error": "channel_not_found"}})
+    monkeypatch.setattr(
+        "app.agents.investigation.live.slack_live.httpx.AsyncClient",
+        lambda *args, **kwargs: fake_http,
+    )
+
+    with pytest.raises(LiveSourceError) as excinfo:
+        await source.fetch_live_evidence(
+            connector=connector_config,
+            query="checkout",
+            since=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            limit=5,
+        )
+    assert not isinstance(excinfo.value, LiveSourceAuthError)
+
+
+@pytest.mark.asyncio
+async def test_one_bad_channel_does_not_fail_the_whole_lookup(monkeypatch) -> None:
+    source = SlackLiveSource()
+    connector_config = _connector_config(["C_BAD", "C_GOOD"])
+
+    def history(params: dict[str, Any]) -> dict[str, Any]:
+        if params["channel"] == "C_BAD":
+            return {"ok": False, "error": "not_in_channel"}
+        return {"ok": True, "messages": [{"ts": "1790000000.000100", "text": "checkout is down"}]}
+
+    fake_http = _FakeHttpClient({"conversations.history": history})
     monkeypatch.setattr(
         "app.agents.investigation.live.slack_live.httpx.AsyncClient",
         lambda *args, **kwargs: fake_http,
     )
 
     result = await source.fetch_live_evidence(
-        connector_config=connector_config,
+        connector=connector_config,
         query="checkout",
         since=datetime(2026, 7, 1, tzinfo=timezone.utc),
         limit=5,
     )
 
-    assert result == []
+    assert [item.metadata["channel_id"] for item in result] == ["C_GOOD"]
 
 
 @pytest.mark.asyncio
@@ -147,7 +192,7 @@ async def test_fetch_live_evidence_with_no_keywords_matches_everything(monkeypat
     )
 
     result = await source.fetch_live_evidence(
-        connector_config=connector_config,
+        connector=connector_config,
         query="is to a",  # all below _MIN_KEYWORD_LENGTH
         since=datetime(2026, 7, 1, tzinfo=timezone.utc),
         limit=5,

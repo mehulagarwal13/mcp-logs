@@ -102,7 +102,10 @@ async def _get_or_create_organization(session, *, name: str, slug: str) -> Organ
 
 
 async def _ensure_user_with_password(session, *, email: str, display_name: str, password: str):
-    user_id = await users_service.get_or_create_user(session, email=email, display_name=display_name)
+    user_id = await users_service.get_or_create_user(
+        session, email=email, display_name=display_name,
+        email_verified_via="operator_attestation",  # e2e bootstrap: trusted, explicit
+    )
     await users_service.set_password(session, user_id=user_id, password_hash=_hash_password(password))
     return user_id
 

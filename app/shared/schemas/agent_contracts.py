@@ -72,6 +72,53 @@ class RootCauseHypothesis(BaseModel):
     supporting_evidence_ids: list[str]
 
 
+LiveSourceOutcomeKind = Literal["ok", "auth_failed", "error", "skipped", "not_implemented"]
+LiveEvidenceOverallStatus = Literal["not_attempted", "unavailable", "ok", "partial", "failed"]
+
+
+class LiveSourceOutcome(BaseModel):
+    """How one live source (one connector) fared during an investigation.
+
+    `reason` is a short, fixed-vocabulary code (for example
+    `"credential_unavailable"`), never raw exception text: provider error
+    messages can echo request details, and this object is returned to API
+    and MCP callers and stored on the incident timeline.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    source: str
+    connector_config_id: uuid.UUID | None = None
+    outcome: LiveSourceOutcomeKind
+    items_returned: int = 0
+    reason: str | None = None
+
+
+class LiveEvidenceStatus(BaseModel):
+    """Whether live GitHub/Slack evidence was collected for an investigation,
+    so a thin result is never mistaken for "nothing found".
+
+    - `not_attempted`: live lookup did not run (disabled, no incident
+      context, or indexed evidence was already sufficient).
+    - `unavailable`: it could not run (caller not authorized for the
+      incident, no usable live connector, or only connectors whose live
+      source is not implemented yet). `reason` says which.
+    - `ok`: every attempted source succeeded.
+    - `partial`: at least one source succeeded and at least one did not.
+    - `failed`: sources were attempted and none succeeded.
+
+    A source reported as `not_implemented` (for example the monitoring
+    stub) is listed in `sources` for transparency but is excluded from the
+    ok/partial/failed decision: it never counts as a success or a failure.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    status: LiveEvidenceOverallStatus
+    reason: str | None = None
+    sources: list[LiveSourceOutcome] = Field(default_factory=list)
+
+
 class InvestigationResult(BaseModel):
     """`InvestigationResult` is included in `AskResponse` only when the system chooses 
     the investigation route. It keeps verified evidence (`evidence`) separate from 
@@ -92,6 +139,9 @@ class InvestigationResult(BaseModel):
     critique_verdict: Literal["accept", "revise", "reject"] | None = None
     revision_count: int = 0
     critique_issues: list[str] = Field(default_factory=list)
+    # None only for results produced before this field existed (for example
+    # old incident-timeline entries); every new investigation sets it.
+    live_evidence: LiveEvidenceStatus | None = None
 
 
 class AskResponse(BaseModel):
